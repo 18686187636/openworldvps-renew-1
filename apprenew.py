@@ -317,10 +317,10 @@ def recognize_captcha_by_frames(gif_bytes: bytes, ocr) -> str:
 
     for idx, frame in enumerate(frames):
         w, h = frame.size
-        # 裁剪三个区域
-        left_crop = frame.crop((0, 0, int(w * 0.42), h))
-        mid_crop = frame.crop((int(w * 0.35), 0, int(w * 0.65), h))
-        right_crop = frame.crop((int(w * 0.58), 0, w, h))
+        # 裁剪三个区域 (根据实测调整 left_crop 至 0.52，避免切掉 10/11/12 的第二位数字)
+        left_crop = frame.crop((0, 0, int(w * 0.52), h))
+        mid_crop = frame.crop((int(w * 0.30), 0, int(w * 0.70), h))
+        right_crop = frame.crop((int(w * 0.50), 0, w, h))
 
         for region_name, crop_img, cand_list in [
             ("Left", left_crop, left_candidates),
@@ -330,46 +330,70 @@ def recognize_captcha_by_frames(gif_bytes: bytes, ocr) -> str:
             proc_img = preprocess_frame(crop_img)
             img_buf = io.BytesIO()
             proc_img.save(img_buf, format="PNG")
-            
+
             # 使用 ddddocr 识别
             res = ocr.classification(img_buf.getvalue()).strip()
-            
+
             # 清理非数字/运算符字符
             if region_name in ("Left", "Right"):
-                # 只保留数字，统一模糊识别字符
-                res_clean = re.sub(r'[^0-9]', '', res.replace('O', '0').replace('o', '0').replace('l', '1').replace('I', '1').replace('S', '5').replace('s', '5').replace('B', '8').replace('g', '9').replace('q', '9').replace('z', '2').replace('Z', '2'))
+                # 数字清理：支持 10/11/12 组合模式识别与常见变体
+                s = res.replace('I2', '12').replace('l1', '11')
+                s = s.replace('t0', '10').replace('1o', '10').replace('1c', '10').replace('I0', '10')
+                s = s.replace('ll', '11').replace('li', '11').replace('II', '11').replace('i1', '11')
+                s = s.replace('O', '0').replace('o', '0').replace('c', '0').replace('d', '0')
+                s = s.replace('l', '1').replace('I', '1').replace('t', '1').replace('T', '1')
+                s = s.replace('S', '5').replace('s', '5')
+                s = s.replace('Z', '2').replace('z', '2')
+                s = s.replace('B', '8').replace('b', '6')
+                s = s.replace('g', '9').replace('q', '9')
+                s = s.replace('>', '7')
+                res_clean = re.sub(r'[^0-9]', '', s)
             else:
-                # 运算符 region：匹配 + - * /
+                # 运算符 region：匹配 + - * / (含 + 上半部分/倒立T字符/模糊符提取)
                 res_clean = ""
                 for char in res:
-                    if char in "+-*/":
-                        res_clean += char
-                    elif char in ("x", "X", "×"):
+                    if char in ("*", "x", "X", "×", "y"):
                         res_clean += "*"
+                    elif char in ("+", "十", "t", "T", "┴", "⊥", "丄"):
+                        res_clean += "+"
+                    elif char in ("-", "—", "–", "一"):
+                        res_clean += "-"
                     elif char in ("÷", ":"):
                         res_clean += "/"
-                    elif char in ("一", "—", "–"):
-                        res_clean += "-"
-                    elif char in ("十", "t", "T"):
-                        res_clean += "+"
 
             if res_clean:
                 cand_list.append(res_clean)
 
-    # 统计出现最高频的左数字、运算符、右数字
+    # 统计出现最高频的左数字、运算符、右数字 (优先匹配 2 位数字)
     from collections import Counter
-    
-    num_a = Counter(left_candidates).most_common(1)[0][0] if left_candidates else ""
-    op = Counter(op_candidates).most_common(1)[0][0] if op_candidates else ""
-    num_b = Counter(right_candidates).most_common(1)[0][0] if right_candidates else ""
+
+    def pick_best_num(cand_list):
+        if not cand_list:
+            return ""
+        two_digits = [c for c in cand_list if len(c) == 2]
+        if two_digits:
+            return Counter(two_digits).most_common(1)[0][0]
+        return Counter(cand_list).most_common(1)[0][0]
+
+    num_a = pick_best_num(left_candidates)
+    num_b = pick_best_num(right_candidates)
+
+    # 运算符决策：优先匹配出现的 + / * / -，若没识别出来则按用户指示默认减法 "-"
+    if "*" in op_candidates and op_candidates.count("*") >= 2:
+        op = "*"
+    elif "+" in op_candidates:
+        op = "+"
+    elif "*" in op_candidates:
+        op = "*"
+    elif "-" in op_candidates:
+        op = "-"
+    else:
+        op = "-"  # 用户指定：如果运算符没识别出来，默认减法尝试
 
     print(f"   🔍 跨帧区域统计结果 -> 左数字(A): '{num_a}' | 运算符: '{op}' | 右数字(B): '{num_b}'")
 
     # 拼接算式并求解
     if num_a and num_b:
-        # 如果运算符没识别出来，默认加法或减法尝试
-        if not op:
-            op = "+"
         expr = f"{num_a}{op}{num_b}"
         try:
             val = int(eval(expr))
