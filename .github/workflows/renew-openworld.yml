@@ -13,10 +13,10 @@ jobs:
       contents: read
 
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v4.2.2
 
       - name: ⚙ 设置 Python
-        uses: actions/setup-python@v6
+        uses: actions/setup-python@v5.4.0
         with:
           python-version: '3.12'
 
@@ -34,7 +34,7 @@ jobs:
           TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
           HEADLESS: "true"
         run: |
-          xvfb-run --auto-servernum python3 apprenew.py
+          xvfb-run --auto-servernum python3 apprenew旧版.py
 
       - name: 💾 上传验证码 GIF
         if: always()
