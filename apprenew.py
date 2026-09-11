@@ -11,7 +11,6 @@ import requests
 import time
 from datetime import datetime, timedelta, timezone
 from PIL import Image
-import numpy as np
 from playwright.sync_api import sync_playwright
 
 # ================= 配置区 =================
@@ -44,15 +43,23 @@ def send_telegram_message(message: str):
     full_message = f"👤 账号: {ACCOUNT_NAME}\n{message}"
     url = f"https://api.telegram.org/bot{TG_BOT_TOKEN}/sendMessage"
     try:
-        requests.post(url, json={"chat_id": TG_CHAT_ID, "text": full_message}, timeout=10)
-        print("✅ Telegram 通知已发送")
+        resp = requests.post(url, json={"chat_id": TG_CHAT_ID, "text": full_message}, timeout=10)
+        if resp.status_code == 200:
+            print("✅ Telegram 通知已发送")
+        else:
+            print(f"❌ Telegram 发送失败: HTTP {resp.status_code} - {resp.text[:200]}")
     except Exception as e:
-        print(f"❌ Telegram 发送失败: {e}")
+        print(f"❌ Telegram 发送异常: {e}")
 
 
 def save_screenshot(page, name: str):
-    """已禁用 PNG 截图保存（仅保留原始验证码 GIF 文件）"""
-    pass
+    """保存页面截图（调试用）"""
+    try:
+        path = os.path.join(SCREENSHOT_DIR, f"{name}.png")
+        page.screenshot(path=path, full_page=False)
+        print(f"   📸 截图已保存: {path}")
+    except Exception as e:
+        print(f"   ⚠️ 截图失败: {e}")
 
 
 def wait_for_cloudflare(page, timeout=15):
@@ -78,133 +85,158 @@ def wait_for_cloudflare(page, timeout=15):
 def login_with_discord_token(page, dc_token: str) -> bool:
     """
     通过 Discord Token 完成 OAuth 登录到 openworld.eu.org。
-    
-    流程：
-    1. 访问 /discord-login 触发服务端 302 重定向到 Discord OAuth 页面
-    2. 从重定向后的 URL 中提取 OAuth 参数（client_id, redirect_uri, scope, state）
-    3. 使用 Discord Token 通过 API 直接完成授权
-    4. 用返回的回调 URL 完成登录
+    适配 2026 年网站更新后的 /login 页面结构。
     """
     print("=" * 50)
     print("🔑 开始 Discord OAuth 登录流程")
     print("=" * 50)
 
-    # ========== 第1步：触发 Discord OAuth 重定向 ==========
-    # openworld.eu.org 的登录按钮指向 /discord-login，
-    # 服务端会 302 重定向到 Discord 的 OAuth2 授权页面
-    discord_login_url = f"{SITE_BASE}/discord-login"
-    print(f"\n📌 第1步：访问 Discord 登录入口: {discord_login_url}")
-
+    # ========== 第1步：访问首页建立基础 session ==========
+    print(f"\n📌 第1步：访问首页建立基础 Cookie/Session")
     try:
-        # 先访问首页建立基础 cookie/session
         page.goto(SITE_BASE, wait_until="domcontentloaded", timeout=30000)
         wait_for_cloudflare(page)
         time.sleep(2)
         print(f"   首页加载完成，当前 URL: {page.url}")
-
-        # 访问 /discord-login，这会触发 302 到 Discord
-        page.goto(discord_login_url, wait_until="domcontentloaded", timeout=30000)
-        time.sleep(3)
     except Exception as e:
-        print(f"   ⚠️ 页面加载异常: {e}")
-        # 即使超时也可能已经跳转了，继续检查
+        print(f"   ⚠️ 首页加载异常: {e}")
+
+    # ========== 第2步：访问 /login 页面并触发 OAuth ==========
+    login_url = f"{SITE_BASE}/login"
+    print(f"\n📌 第2步：访问登录页: {login_url}")
+    try:
+        page.goto(login_url, wait_until="domcontentloaded", timeout=30000)
+        wait_for_cloudflare(page)
+        time.sleep(3)
+        print(f"   登录页加载完成，当前 URL: {page.url}")
+    except Exception as e:
+        print(f"   ⚠️ 登录页加载异常: {e}")
 
     current_url = page.url
-    print(f"   跳转后 URL: {current_url}")
+    print(f"   当前 URL: {current_url}")
 
-    # ========== 第2步：检查是否到达了 Discord 授权页 ==========
-    print(f"\n📌 第2步：检查 Discord OAuth 页面")
+    # ========== 第3步：触发 Discord OAuth 跳转 ==========
+    print(f"\n📌 第3步：检查是否到达 Discord OAuth 页面")
 
-    # 如果还在 openworld 的登录页，尝试点击 Discord 按钮
     if "discord.com" not in current_url:
-        print("   未自动跳转到 Discord，尝试在登录页查找 Discord 按钮...")
-        save_screenshot(page, "before_discord_click")
+        print("   未自动跳转，尝试点击登录按钮...")
 
-        try:
-            # 查找登录页上的 Discord 登录链接/按钮
-            discord_btn = page.locator("a[href*='discord-login'], a[href*='discord'], a:has-text('Discord')").first
-            if discord_btn.is_visible(timeout=5000):
-                href = discord_btn.get_attribute("href")
-                print(f"   找到 Discord 按钮，href={href}")
-                discord_btn.click()
-                time.sleep(5)
-                current_url = page.url
-                print(f"   点击后 URL: {current_url}")
-        except Exception as e:
-            print(f"   ⚠️ 查找/点击 Discord 按钮失败: {e}")
+        btn_selectors = [
+            "button:has-text('Sign in')",
+            "a:has-text('Sign in')",
+            "button:has-text('Discord')",
+            "a:has-text('Discord')",
+            "button:has-text('登录')",
+            "a:has-text('登录')",
+            "[class*='discord']",
+            "[class*='login']",
+            "button[type='submit']",
+        ]
 
-    # 再次检查
+        clicked = False
+        for selector in btn_selectors:
+            try:
+                btn = page.locator(selector).first
+                if btn.is_visible(timeout=3000):
+                    btn_text = btn.inner_text().strip()
+                    print(f"   找到按钮: '{btn_text}' (选择器: {selector})，点击...")
+                    btn.click()
+                    clicked = True
+                    time.sleep(5)
+                    current_url = page.url
+                    print(f"   点击后 URL: {current_url}")
+                    if "discord.com" in current_url:
+                        break
+            except Exception:
+                continue
+
+        # 如果点击后仍未到 Discord，尝试从页面源码中提取 OAuth 链接
+        if "discord.com" not in current_url:
+            print("   点击按钮未跳转，尝试从页面源码提取 OAuth 链接...")
+            try:
+                page_html = page.content()
+                oauth_match = re.search(
+                    r'https://discord\.com/oauth2/authorize[^\s"\'<>]+',
+                    page_html
+                )
+                if oauth_match:
+                    direct_url = oauth_match.group(0)
+                    print(f"   找到 OAuth 链接: {direct_url[:80]}...")
+                    page.goto(direct_url, wait_until="domcontentloaded", timeout=30000)
+                    time.sleep(3)
+                    current_url = page.url
+                    print(f"   导航后 URL: {current_url}")
+            except Exception as e:
+                print(f"   ⚠️ 源码提取 OAuth 链接失败: {e}")
+
+    # 最后一次等待延迟跳转
     if "discord.com" not in current_url:
-        # 最后尝试：有些网站的 /discord-login 可能需要处理 Cloudflare
-        print("   仍未到达 Discord，等待可能的延迟重定向...")
+        print("   等待可能的延迟重定向...")
         for i in range(10):
             time.sleep(1)
             current_url = page.url
             if "discord.com" in current_url:
                 break
-        
-        if "discord.com" not in current_url:
-            print(f"   ❌ 无法跳转到 Discord 授权页面")
-            print(f"   当前 URL: {current_url}")
-            print(f"   页面标题: {page.title()}")
-            save_screenshot(page, "login_failed_no_discord")
-            return False
 
-    # ========== 第3步：从 URL 解析 OAuth 参数 ==========
-    print(f"\n📌 第3步：解析 OAuth 参数")
+    if "discord.com" not in current_url:
+        print(f"   ❌ 无法跳转到 Discord 授权页面")
+        print(f"   当前 URL: {current_url}")
+        print(f"   页面标题: {page.title()}")
+        save_screenshot(page, "login_failed_no_discord")
+        return False
+
+    print(f"   ✅ 已到达 Discord OAuth 页面")
+
+    # ========== 第4步：从 URL 解析 OAuth 参数 ==========
+    print(f"\n📌 第4步：解析 OAuth 参数")
     oauth_url = page.url
-    print(f"   Discord OAuth URL: {oauth_url[:100]}...")
-
     parsed = urllib.parse.urlparse(oauth_url)
     params = urllib.parse.parse_qs(parsed.query)
 
-    client_id    = params.get("client_id", [""])[0]
+    client_id = params.get("client_id", [""])[0]
     redirect_uri = params.get("redirect_uri", [""])[0]
-    scope        = params.get("scope", ["identify email"])[0]
-    state        = params.get("state", [""])[0]
+    scope = params.get("scope", ["identify email"])[0]
+    state = params.get("state", [""])[0]
     response_type = params.get("response_type", ["code"])[0]
 
     print(f"   Client ID:    {client_id}")
     print(f"   Redirect URI: {redirect_uri}")
     print(f"   Scope:        {scope}")
-    print(f"   State:        {state[:20]}..." if state else "   State:        (空)")
 
     if not client_id or not redirect_uri:
         print("   ❌ 无法解析关键 OAuth 参数 (client_id 或 redirect_uri)")
         save_screenshot(page, "login_failed_parse")
         return False
 
-    # ========== 第4步：通过 API 完成 Discord 授权 ==========
-    print(f"\n📌 第4步：通过 Discord API 完成授权")
+    # ========== 第5步：通过 Discord API 完成授权 ==========
+    print(f"\n📌 第5步：通过 Discord API 完成授权")
 
-    # 构建 API URL
     api_params = urllib.parse.urlencode({
-        "client_id":     client_id,
+        "client_id": client_id,
         "response_type": response_type,
-        "redirect_uri":  redirect_uri,
-        "scope":         scope,
-        "state":         state,
+        "redirect_uri": redirect_uri,
+        "scope": scope,
+        "state": state,
     })
     authorize_api = f"https://discord.com/api/v9/oauth2/authorize?{api_params}"
 
-    # 构建 referer
     referer_params = urllib.parse.urlencode({
-        "client_id":     client_id,
-        "redirect_uri":  redirect_uri,
+        "client_id": client_id,
+        "redirect_uri": redirect_uri,
         "response_type": response_type,
-        "scope":         scope,
-        "state":         state,
+        "scope": scope,
+        "state": state,
     })
     referer = f"https://discord.com/oauth2/authorize?{referer_params}"
 
     headers = {
-        "accept":           "*/*",
-        "authorization":    dc_token.strip(),
-        "content-type":     "application/json",
-        "origin":           "https://discord.com",
-        "referer":          referer,
-        "user-agent":       ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-                             "(KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36"),
+        "accept": "*/*",
+        "authorization": dc_token.strip(),
+        "content-type": "application/json",
+        "origin": "https://discord.com",
+        "referer": referer,
+        "user-agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                       "(KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36"),
         "x-discord-locale": "zh-CN",
     }
 
@@ -242,9 +274,8 @@ def login_with_discord_token(page, dc_token: str) -> bool:
     masked_location = re.sub(r"code=[^&]+", "code=***", location)
     print(f"   ✅ 拿到回调 URL: {masked_location}")
 
-    # ========== 第5步：用回调 URL 完成登录 ==========
-    print(f"\n📌 第5步：通过回调 URL 完成登录写入 Cookie")
-
+    # ========== 第6步：用回调 URL 完成登录 ==========
+    print(f"\n📌 第6步：通过回调 URL 完成登录写入 Cookie")
     try:
         page.goto(location, wait_until="domcontentloaded", timeout=30000)
     except Exception as e:
@@ -256,15 +287,13 @@ def login_with_discord_token(page, dc_token: str) -> bool:
     final_url = page.url
     print(f"   回调后 URL: {final_url}")
 
-    # 检查是否登录成功
     if "/login" in final_url and "discord" not in final_url:
         print("   ⚠️ 回调后仍在登录页，登录可能失败")
-        save_screenshot(page, "login_callback_stuck")
-        # 有些情况下需要等待更久
         time.sleep(5)
         final_url = page.url
         if "/login" in final_url:
             print(f"   ❌ 登录最终失败，停留在: {final_url}")
+            save_screenshot(page, "login_callback_stuck")
             return False
 
     if "openworld.eu.org" in final_url:
@@ -274,7 +303,6 @@ def login_with_discord_token(page, dc_token: str) -> bool:
 
     print(f"   ⚠️ 登录状态不确定，当前 URL: {final_url}")
     save_screenshot(page, "login_uncertain")
-    # 尝试继续，后续访问 VPS 页面会验证
     return True
 
 
@@ -310,6 +338,8 @@ def recognize_captcha_by_frames(gif_bytes: bytes, ocr) -> str:
     3. 过滤并只保留数字/运算符字符，跨帧统计出现频率最高的字符。
     4. 组合成算式并计算结果。
     """
+    from collections import Counter
+
     frames = extract_gif_frames(gif_bytes)
     if not frames:
         return ""
@@ -368,8 +398,6 @@ def recognize_captcha_by_frames(gif_bytes: bytes, ocr) -> str:
                 cand_list.append(res_clean)
 
     # 统计出现最高频的左数字、运算符、右数字 (优先匹配 2 位数字)
-    from collections import Counter
-
     def pick_best_num(cand_list):
         if not cand_list:
             return ""
@@ -416,7 +444,7 @@ def recognize_captcha_by_frames(gif_bytes: bytes, ocr) -> str:
         cleaned = re.sub(r'[^0-9+\-*/]', '', res.replace('x', '*').replace('X', '*').replace('O', '0').replace('o', '0').replace('l', '1'))
         if cleaned:
             all_text.append(cleaned)
-            
+
     if all_text:
         most_common_full = Counter(all_text).most_common(1)[0][0]
         match = re.search(r'(\d+)\s*([+\-*/])\s*(\d+)', most_common_full)
@@ -801,7 +829,6 @@ def main():
             if not success:
                 print("\n❌ 登录流程失败，脚本退出。")
                 send_telegram_message("❌ Openworld VPS 续期失败：登录流程失败")
-                browser.close()
                 return
 
             # ========== 自动检测 VPS 列表 ==========
@@ -812,7 +839,6 @@ def main():
                 print("💡 请检查账号是否有活跃的 VPS 实例")
                 save_screenshot(page, "no_vps_found")
                 send_telegram_message("❌ Openworld VPS 续期失败：未在面板找到任何 VPS 实例")
-                browser.close()
                 return
 
             # 遍历每个 VPS 实例进行续期检测
