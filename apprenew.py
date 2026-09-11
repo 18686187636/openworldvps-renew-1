@@ -14,29 +14,18 @@ from PIL import Image
 from playwright.sync_api import sync_playwright
 
 # ================= 配置区 =================
-# 从 GitHub Secrets 环境变量获取 Discord Token
 DISCORD_TOKEN = os.environ.get("DISCORD_TOKEN", "")
-
-# TG 通知（可选）
 TG_CHAT_ID   = os.environ.get("TG_CHAT_ID", "")
 TG_BOT_TOKEN = os.environ.get("TG_BOT_TOKEN", "")
-
-# 账号标识（用于 Telegram 通知，可在 Secrets 中设置）
 ACCOUNT_NAME = os.environ.get("ACCOUNT_NAME", "未命名账号")
-
-# 网站根域
 SITE_BASE = "https://openworld.eu.org"
-
-# 续期天数阈值：剩余天数 <= 此值时才执行续期
 RENEW_THRESHOLD_DAYS = 5
 # ==========================================
 
-# 截图保存目录（调试用）
 SCREENSHOT_DIR = os.environ.get("SCREENSHOT_DIR", ".")
 
 
 def send_telegram_message(message: str):
-    """发送 Telegram 通知，自动在消息前添加账号标识"""
     if not TG_BOT_TOKEN or not TG_CHAT_ID:
         print("⚠️ Telegram 未配置，跳过通知")
         return
@@ -53,7 +42,6 @@ def send_telegram_message(message: str):
 
 
 def save_screenshot(page, name: str):
-    """保存页面截图（调试用）"""
     try:
         path = os.path.join(SCREENSHOT_DIR, f"{name}.png")
         page.screenshot(path=path, full_page=False)
@@ -63,10 +51,6 @@ def save_screenshot(page, name: str):
 
 
 def wait_for_cloudflare(page, timeout=15):
-    """
-    等待 Cloudflare 挑战通过。
-    如果页面包含 CF 挑战指示器，等待其消失。
-    """
     cf_indicators = ["verify you are human", "just a moment", "checking your browser",
                      "cf-browser-verification", "challenge-platform"]
     start = time.time()
@@ -150,7 +134,6 @@ def login_with_discord_token(page, dc_token: str) -> bool:
             except Exception:
                 continue
 
-        # 如果点击后仍未到 Discord，尝试从页面源码中提取 OAuth 链接
         if "discord.com" not in current_url:
             print("   点击按钮未跳转，尝试从页面源码提取 OAuth 链接...")
             try:
@@ -169,7 +152,6 @@ def login_with_discord_token(page, dc_token: str) -> bool:
             except Exception as e:
                 print(f"   ⚠️ 源码提取 OAuth 链接失败: {e}")
 
-    # 最后一次等待延迟跳转
     if "discord.com" not in current_url:
         print("   等待可能的延迟重定向...")
         for i in range(10):
@@ -187,9 +169,24 @@ def login_with_discord_token(page, dc_token: str) -> bool:
 
     print(f"   ✅ 已到达 Discord OAuth 页面")
 
-    # ========== 第4步：从 URL 解析 OAuth 参数 ==========
+    # ========== 第4步：从 URL 解析 OAuth 参数（兼容 discord.com/login?redirect_to=...） ==========
     print(f"\n📌 第4步：解析 OAuth 参数")
     oauth_url = page.url
+    print(f"   当前 Discord URL: {oauth_url[:120]}...")
+
+    # 处理 discord.com/login?redirect_to=... 的情况
+    if "discord.com/login" in oauth_url and "redirect_to=" in oauth_url:
+        parsed_login = urllib.parse.urlparse(oauth_url)
+        login_params = urllib.parse.parse_qs(parsed_login.query)
+        redirect_to = login_params.get("redirect_to", [""])[0]
+        if redirect_to:
+            if redirect_to.startswith("/"):
+                oauth_url = "https://discord.com" + redirect_to
+            else:
+                oauth_url = redirect_to
+            print(f"   从 redirect_to 解码出 OAuth URL: {oauth_url[:120]}...")
+
+    # 现在从 oauth_url 解析参数
     parsed = urllib.parse.urlparse(oauth_url)
     params = urllib.parse.parse_qs(parsed.query)
 
@@ -198,10 +195,15 @@ def login_with_discord_token(page, dc_token: str) -> bool:
     scope = params.get("scope", ["identify email"])[0]
     state = params.get("state", [""])[0]
     response_type = params.get("response_type", ["code"])[0]
+    access_type = params.get("access_type", [""])[0]
+    prompt = params.get("prompt", [""])[0]
 
     print(f"   Client ID:    {client_id}")
     print(f"   Redirect URI: {redirect_uri}")
     print(f"   Scope:        {scope}")
+    print(f"   State:        {state[:20]}..." if state else "   State:        (空)")
+    print(f"   Access Type:  {access_type}")
+    print(f"   Prompt:       {prompt}")
 
     if not client_id or not redirect_uri:
         print("   ❌ 无法解析关键 OAuth 参数 (client_id 或 redirect_uri)")
@@ -211,22 +213,34 @@ def login_with_discord_token(page, dc_token: str) -> bool:
     # ========== 第5步：通过 Discord API 完成授权 ==========
     print(f"\n📌 第5步：通过 Discord API 完成授权")
 
-    api_params = urllib.parse.urlencode({
+    api_params_dict = {
         "client_id": client_id,
         "response_type": response_type,
         "redirect_uri": redirect_uri,
         "scope": scope,
         "state": state,
-    })
+    }
+    if access_type:
+        api_params_dict["access_type"] = access_type
+    if prompt:
+        api_params_dict["prompt"] = prompt
+
+    api_params = urllib.parse.urlencode(api_params_dict)
     authorize_api = f"https://discord.com/api/v9/oauth2/authorize?{api_params}"
 
-    referer_params = urllib.parse.urlencode({
+    referer_params_dict = {
         "client_id": client_id,
         "redirect_uri": redirect_uri,
         "response_type": response_type,
         "scope": scope,
         "state": state,
-    })
+    }
+    if access_type:
+        referer_params_dict["access_type"] = access_type
+    if prompt:
+        referer_params_dict["prompt"] = prompt
+
+    referer_params = urllib.parse.urlencode(referer_params_dict)
     referer = f"https://discord.com/oauth2/authorize?{referer_params}"
 
     headers = {
@@ -306,13 +320,14 @@ def login_with_discord_token(page, dc_token: str) -> bool:
     return True
 
 
+# ================= 以下函数保持不变 =================
+
 def extract_gif_frames(gif_bytes: bytes) -> list:
-    """提取 GIF 所有帧为 PIL Image 列表"""
     gif = Image.open(io.BytesIO(gif_bytes))
     frames = []
     try:
         while True:
-            frame = gif.convert("L")  # 转灰度
+            frame = gif.convert("L")
             frames.append(frame.copy())
             gif.seek(gif.tell() + 1)
     except EOFError:
@@ -322,7 +337,6 @@ def extract_gif_frames(gif_bytes: bytes) -> list:
 
 
 def preprocess_frame(img: Image.Image) -> Image.Image:
-    """对单帧图像进行预处理：二值化 + 放大"""
     threshold = 170
     binary = img.point(lambda p: 0 if p < threshold else 255, "L")
     w, h = binary.size
@@ -331,26 +345,18 @@ def preprocess_frame(img: Image.Image) -> Image.Image:
 
 
 def recognize_captcha_by_frames(gif_bytes: bytes, ocr) -> str:
-    """
-    分解帧识别验证码：
-    1. 获取每一帧。
-    2. 对每一帧分为 Left（左半边，数字A）、Middle（中间，运算符）、Right（右半边，数字B）。
-    3. 过滤并只保留数字/运算符字符，跨帧统计出现频率最高的字符。
-    4. 组合成算式并计算结果。
-    """
     from collections import Counter
 
     frames = extract_gif_frames(gif_bytes)
     if not frames:
         return ""
 
-    left_candidates = []   # 数字A候选
-    op_candidates = []     # 运算符候选
-    right_candidates = []  # 数字B候选
+    left_candidates = []
+    op_candidates = []
+    right_candidates = []
 
     for idx, frame in enumerate(frames):
         w, h = frame.size
-        # 裁剪三个区域 (根据实测调整 left_crop 至 0.52，避免切掉 10/11/12 的第二位数字)
         left_crop = frame.crop((0, 0, int(w * 0.52), h))
         mid_crop = frame.crop((int(w * 0.30), 0, int(w * 0.70), h))
         right_crop = frame.crop((int(w * 0.50), 0, w, h))
@@ -363,13 +369,9 @@ def recognize_captcha_by_frames(gif_bytes: bytes, ocr) -> str:
             proc_img = preprocess_frame(crop_img)
             img_buf = io.BytesIO()
             proc_img.save(img_buf, format="PNG")
-
-            # 使用 ddddocr 识别
             res = ocr.classification(img_buf.getvalue()).strip()
 
-            # 清理非数字/运算符字符
             if region_name in ("Left", "Right"):
-                # 数字清理：支持 10/11/12 组合模式识别与常见变体
                 s = res.replace('I2', '12').replace('l1', '11')
                 s = s.replace('t0', '10').replace('1o', '10').replace('1c', '10').replace('I0', '10')
                 s = s.replace('ll', '11').replace('li', '11').replace('II', '11').replace('i1', '11')
@@ -382,7 +384,6 @@ def recognize_captcha_by_frames(gif_bytes: bytes, ocr) -> str:
                 s = s.replace('>', '7')
                 res_clean = re.sub(r'[^0-9]', '', s)
             else:
-                # 运算符 region：匹配 + - * / (含 + 上半部分/倒立T字符/模糊符提取)
                 res_clean = ""
                 for char in res:
                     if char in ("*", "x", "X", "×", "y"):
@@ -397,7 +398,6 @@ def recognize_captcha_by_frames(gif_bytes: bytes, ocr) -> str:
             if res_clean:
                 cand_list.append(res_clean)
 
-    # 统计出现最高频的左数字、运算符、右数字 (优先匹配 2 位数字)
     def pick_best_num(cand_list):
         if not cand_list:
             return ""
@@ -409,7 +409,6 @@ def recognize_captcha_by_frames(gif_bytes: bytes, ocr) -> str:
     num_a = pick_best_num(left_candidates)
     num_b = pick_best_num(right_candidates)
 
-    # 运算符决策：优先匹配出现的 + / * / -，若没识别出来则按用户指示默认减法 "-"
     if "*" in op_candidates and op_candidates.count("*") >= 2:
         op = "*"
     elif "+" in op_candidates:
@@ -419,11 +418,10 @@ def recognize_captcha_by_frames(gif_bytes: bytes, ocr) -> str:
     elif "-" in op_candidates:
         op = "-"
     else:
-        op = "-"  # 用户指定：如果运算符没识别出来，默认减法尝试
+        op = "-"
 
     print(f"   🔍 跨帧区域统计结果 -> 左数字(A): '{num_a}' | 运算符: '{op}' | 右数字(B): '{num_b}'")
 
-    # 拼接算式并求解
     if num_a and num_b:
         expr = f"{num_a}{op}{num_b}"
         try:
@@ -433,14 +431,12 @@ def recognize_captcha_by_frames(gif_bytes: bytes, ocr) -> str:
         except Exception as e:
             print(f"   ⚠️ 计算异常 ({expr}): {e}")
 
-    # 如果区域切分没拿到结果，尝试全图逐帧识别
     all_text = []
     for frame in frames:
         proc_img = preprocess_frame(frame)
         img_buf = io.BytesIO()
         proc_img.save(img_buf, format="PNG")
         res = ocr.classification(img_buf.getvalue()).strip()
-        # 清理常见错别字
         cleaned = re.sub(r'[^0-9+\-*/]', '', res.replace('x', '*').replace('X', '*').replace('O', '0').replace('o', '0').replace('l', '1'))
         if cleaned:
             all_text.append(cleaned)
@@ -458,10 +454,6 @@ def recognize_captcha_by_frames(gif_bytes: bytes, ocr) -> str:
 
 
 def download_captcha_gif(page) -> bytes:
-    """
-    从页面中获取验证码 GIF 图片的原始字节数据。
-    重点处理 blob: URL —— 必须在浏览器上下文内 fetch 才能拿到完整的多帧 GIF。
-    """
     import base64
 
     captcha_selectors = [
@@ -489,7 +481,6 @@ def download_captcha_gif(page) -> bytes:
     src = captcha_element.get_attribute("src") or ""
     print(f"   📥 验证码 src: {src[:100]}")
 
-    # ========== 方法1：blob: URL —— 在浏览器内 fetch 获取完整 GIF ==========
     if src.startswith("blob:"):
         print("   📦 检测到 blob: URL，通过浏览器内 fetch 获取完整 GIF...")
         try:
@@ -518,7 +509,6 @@ def download_captcha_gif(page) -> bytes:
         except Exception as e:
             print(f"   ⚠️ blob fetch 失败: {e}")
 
-    # ========== 方法2：普通 http/https URL —— 用 requests 下载 ==========
     elif src.startswith("http"):
         try:
             cookies = page.context.cookies()
@@ -532,7 +522,6 @@ def download_captcha_gif(page) -> bytes:
         except Exception as e:
             print(f"   ⚠️ HTTP 下载异常: {e}")
 
-    # ========== 方法3：相对路径 URL ==========
     elif src.startswith("/"):
         full_url = f"{SITE_BASE}{src}"
         try:
@@ -545,10 +534,8 @@ def download_captcha_gif(page) -> bytes:
         except Exception as e:
             print(f"   ⚠️ 相对路径下载异常: {e}")
 
-    # ========== 方法4：data: URL ==========
     elif src.startswith("data:"):
         try:
-            # data:image/gif;base64,xxxxx
             b64_part = src.split(",", 1)[1]
             gif_bytes = base64.b64decode(b64_part)
             print(f"   ✅ data: URL 解码成功 ({len(gif_bytes)} bytes)")
@@ -556,7 +543,6 @@ def download_captcha_gif(page) -> bytes:
         except Exception as e:
             print(f"   ⚠️ data: URL 解码失败: {e}")
 
-    # ========== 回退：元素截图（只能拍当前帧，最后手段） ==========
     print("   ⚠️ 所有下载方式失败，回退到元素截图（只能获取单帧）")
     try:
         return captcha_element.screenshot()
@@ -566,11 +552,6 @@ def download_captcha_gif(page) -> bytes:
 
 
 def try_renew_captcha(page, initial_days: int, max_attempts=5) -> bool:
-    """
-    尝试执行验证码续期流程，最多重试 max_attempts 次。
-    以提交后剩余天数是否增加到 6 天来判断续期是否真正成功。
-    返回 True 表示续期成功。
-    """
     try:
         import ddddocr
     except ImportError:
@@ -586,7 +567,6 @@ def try_renew_captcha(page, initial_days: int, max_attempts=5) -> bool:
         print(f"   {'='*40}")
 
         try:
-            # ========== 第1步：点击 Renew free 按钮打开弹窗 ==========
             print("   🔍 寻找并点击 [Renew free] 按钮...")
             renew_selectors = [
                 "button:has-text('Renew free')",
@@ -612,7 +592,6 @@ def try_renew_captcha(page, initial_days: int, max_attempts=5) -> bool:
                 return False
             time.sleep(3)
 
-            # ========== 第2步：下载并识别验证码 ==========
             print("   ⏳ 等待验证码图片加载...")
             time.sleep(1)
 
@@ -621,7 +600,6 @@ def try_renew_captcha(page, initial_days: int, max_attempts=5) -> bool:
                 print("   ⚠️ 未获取到验证码图片")
                 continue
 
-            # 保存原始 GIF（调试用）
             gif_path = os.path.join(SCREENSHOT_DIR, f"captcha_raw_{attempt}.gif")
             try:
                 with open(gif_path, "wb") as f:
@@ -630,11 +608,9 @@ def try_renew_captcha(page, initial_days: int, max_attempts=5) -> bool:
             except Exception:
                 pass
 
-            # 分解帧识别算式并求解
             answer = recognize_captcha_by_frames(gif_bytes, ocr)
             if not answer:
                 print("   ⚠️ 验证码识别求解失败，刷新重试...")
-                # 刷新页面恢复干净状态
                 try:
                     page.reload(wait_until="domcontentloaded", timeout=15000)
                 except Exception:
@@ -643,7 +619,6 @@ def try_renew_captcha(page, initial_days: int, max_attempts=5) -> bool:
 
             print(f"   📝 最终计算答案: {answer}")
 
-            # ========== 第3步：填入并提交 ==========
             input_selectors = [
                 "input[placeholder='Answer']",
                 "input[placeholder='answer']",
@@ -657,7 +632,7 @@ def try_renew_captcha(page, initial_days: int, max_attempts=5) -> bool:
                 try:
                     inp = page.locator(selector).first
                     if inp.is_visible(timeout=3000):
-                        inp.fill("")  # 先清空
+                        inp.fill("")
                         inp.fill(answer)
                         input_filled = True
                         print(f"   ✅ 答案已填入: {answer} (选择器: {selector})")
@@ -669,7 +644,6 @@ def try_renew_captcha(page, initial_days: int, max_attempts=5) -> bool:
                 print("   ❌ 未找到验证码输入框")
                 continue
 
-            # 提交
             confirm_selectors = [
                 "button:has-text('Confirm Renewal')",
                 "button:has-text('Confirm')",
@@ -693,7 +667,6 @@ def try_renew_captcha(page, initial_days: int, max_attempts=5) -> bool:
                 print("   ❌ 未找到提交按钮")
                 continue
 
-            # ========== 第4步：等待提交完成并刷新页面读取真实天数 ==========
             print("   ⏳ 等待提交请求处理完成...")
             time.sleep(4)
 
@@ -705,7 +678,6 @@ def try_renew_captcha(page, initial_days: int, max_attempts=5) -> bool:
             wait_for_cloudflare(page)
             time.sleep(2)
 
-            # 重新读取页面中的剩余天数
             page_text = page.locator("body").inner_text()
             match = re.search(r"[Rr]enews?\s+in\s+(\d+)\s+days?", page_text)
 
@@ -732,9 +704,6 @@ def try_renew_captcha(page, initial_days: int, max_attempts=5) -> bool:
 
 
 def get_vps_urls(page) -> list:
-    """
-    自动从当前页面或控制面板/仪表盘中寻找用户绑定的 VPS 详情页 URL。
-    """
     vps_urls = []
 
     def extract_vps_links():
@@ -753,10 +722,8 @@ def get_vps_urls(page) -> list:
         return found
 
     print("\n🔍 正在自动识别账号下的 VPS 实例...")
-    # 1. 先从当前登录落地页提取
     vps_urls = extract_vps_links()
 
-    # 2. 如果没有，前往首页 SITE_BASE
     if not vps_urls:
         try:
             print(f"   前往首页 {SITE_BASE} 提取实例列表...")
@@ -767,7 +734,6 @@ def get_vps_urls(page) -> list:
         except Exception as e:
             print(f"   ⚠️ 前往首页提取失败: {e}")
 
-    # 3. 如果还是没有，尝试访问 /dashboard 或 /vps
     if not vps_urls:
         for sub_path in ["/dashboard", "/vps"]:
             try:
@@ -806,7 +772,6 @@ def main():
     print("🎯 登录后将自动从面板检测 VPS 实例")
 
     with sync_playwright() as p:
-        # 使用更真实的浏览器配置以避免被检测
         browser = p.chromium.launch(
             headless=headless_mode,
             args=[
@@ -823,7 +788,6 @@ def main():
         page = context.new_page()
 
         try:
-            # ========== 登录 ==========
             success = login_with_discord_token(page, DISCORD_TOKEN)
 
             if not success:
@@ -831,7 +795,6 @@ def main():
                 send_telegram_message("❌ Openworld VPS 续期失败：登录流程失败")
                 return
 
-            # ========== 自动检测 VPS 列表 ==========
             target_vps_list = get_vps_urls(page)
 
             if not target_vps_list:
@@ -841,7 +804,6 @@ def main():
                 send_telegram_message("❌ Openworld VPS 续期失败：未在面板找到任何 VPS 实例")
                 return
 
-            # 遍历每个 VPS 实例进行续期检测
             for idx, target_url in enumerate(target_vps_list, 1):
                 print(f"\n{'=' * 50}")
                 print(f"📌 [{idx}/{len(target_vps_list)}] 导航到目标 VPS 页面: {target_url}")
@@ -860,7 +822,6 @@ def main():
                 print(f"📝 当前 URL: {current_url}")
                 print(f"📝 页面标题: {page_title}")
 
-                # 验证是否真正到达了 VPS 页面（而非被重定向到登录页）
                 if "/login" in current_url:
                     print("❌ 被重定向到登录页，Cookie 可能无效")
                     save_screenshot(page, f"redirect_to_login_{idx}")
@@ -869,7 +830,6 @@ def main():
 
                 page_text = page.locator("body").inner_text()
 
-                # 检查是否 404 Page Not Found
                 if "404" in page_title or "Page Not Found" in page_title or "doesn't exist" in page_text.lower():
                     print(f"❌ 目标 VPS 页面不存在或无权访问 (404 Not Found): {target_url}")
                     print("⚠️ 原因分析: 此 URL 对应的机器可能已被注销或不存在。")
@@ -884,7 +844,6 @@ def main():
                 print("✅ 已成功到达目标 VPS 页面")
                 save_screenshot(page, f"vps_page_loaded_{idx}")
 
-                # ========== 检查剩余天数 ==========
                 match = re.search(r"[Rr]enews?\s+in\s+(\d+)\s+days?", page_text)
 
                 if match:
@@ -901,9 +860,8 @@ def main():
                 else:
                     print("⚠️ 未能从页面提取剩余天数，将强制尝试续期")
                     print(f"   页面文本片段: {page_text[:500]}")
-                    days_left = 0  # 未知天数，强制尝试续期
+                    days_left = 0
 
-                # ========== 执行续期 ==========
                 print(f"\n{'=' * 50}")
                 print("🔄 开始执行验证码续期")
                 print(f"{'=' * 50}")
@@ -911,7 +869,6 @@ def main():
                 renew_success = try_renew_captcha(page, initial_days=days_left)
 
                 if renew_success:
-                    # 计算续期后的到期时间（当前时间 + 6天）
                     expiry_time = datetime.now(timezone(timedelta(hours=8))) + timedelta(days=6)
                     expiry_str = expiry_time.strftime("%Y-%m-%d %H:%M:%S") + " (GMT+8)"
                     msg = f"✅ Openworld VPS 续期成功！\n实例: {target_url}\n天数已更新为 6 天\n续期至: {expiry_str}"
