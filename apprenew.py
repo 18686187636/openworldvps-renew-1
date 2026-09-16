@@ -15,6 +15,7 @@ from playwright.sync_api import sync_playwright
 try:
     import numpy as np
     import cv2
+    from numpy.lib.stride_tricks import sliding_window_view
 except ImportError:
     print("❌ 缺少依赖：pip install numpy opencv-python-headless")
     sys.exit(1)
@@ -29,7 +30,6 @@ SITE_BASE     = "https://openworld.eu.org"
 RENEW_THRESHOLD_DAYS = 5
 SCREENSHOT_DIR = os.environ.get("SCREENSHOT_DIR", ".")
 
-# 优先求解的类型；遇到别的类型如果 alt 在偏好里就切
 PREFERRED_KINDS = ("puzzle", "odd")
 MAX_SWITCH_PER_SESSION = 6
 # ==========================================
@@ -78,8 +78,10 @@ def _reset_ws_state():
 
 
 def _install_ws_hook(page):
-    """用 Playwright 原生 WebSocket 事件捕获 meta 和二进制帧。"""
     def on_ws(ws):
+        # 忽略本机 Discord 客户端探测端口，只关心 openworld 的 captcha WS
+        if "openworld.eu.org" not in ws.url:
+            return
         WS_STATE["url"] = ws.url
         print(f"   🔌 WebSocket: {ws.url}")
 
@@ -312,75 +314,71 @@ def login_with_discord_token(page, dc_token: str) -> bool:
     return True
 
 
-# ================= 图片/求解工具 =================
+# ================= 求解器 =================
 
 def _decode(b):
     return cv2.imdecode(np.frombuffer(b, np.uint8), cv2.IMREAD_UNCHANGED)
 
 
-def _ncc_patch(target_gray, patch_gray, patch_mask):
-    """在 target 的固定位置（同尺寸）做加权 NCC。返回 score。"""
-    if target_gray.shape != patch_gray.shape:
-        return -1.0
-    m = patch_mask > 0
-    if m.sum() < 100:
-        return -1.0
-    a = target_gray[m].astype(np.float32)
-    b = patch_gray[m].astype(np.float32)
-    a = a - a.mean()
-    b = b - b.mean()
-    d = float(np.sqrt((a * a).sum()) * np.sqrt((b * b).sum()))
-    if d < 1e-6:
-        return -1.0
-    return float((a * b).sum() / d)
-
-
 def _solve_puzzle(bg_bytes, chip_bytes, meta):
-    """puzzle/key：滑动匹配 chip 在 bg 上的位置，返回 value（= x 坐标）。"""
-    from numpy.lib.stride_tricks import sliding_window_view
-
+    """puzzle/key：向量化 NCC 滑窗，找 chip 左边缘在 bg 上的 x 位置。"""
     bg = _decode(bg_bytes)
     chip = _decode(chip_bytes)
     if bg is None or chip is None:
         raise RuntimeError("解码失败")
     bg_rgb = bg[:, :, :3] if bg.ndim == 3 else cv2.cvtColor(bg, cv2.COLOR_GRAY2BGR)
-    bg_gray = cv2.cvtColor(bg_rgb, cv2.COLOR_BGR2GRAY)
+    bg_gray = cv2.cvtColor(bg_rgb, cv2.COLOR_BGR2GRAY).astype(np.float32)
 
     if chip.ndim != 3 or chip.shape[2] != 4:
         raise RuntimeError("chip 缺少 alpha")
-    chip_gray = cv2.cvtColor(chip[:, :, :3], cv2.COLOR_BGR2GRAY)
-    chip_mask = (chip[:, :, 3] > 100).astype(np.uint8)
+    chip_gray = cv2.cvtColor(chip[:, :, :3], cv2.COLOR_BGR2GRAY).astype(np.float32)
+    chip_mask = (chip[:, :, 3] > 100).astype(np.float32)
+
+    # 按 alpha 内容框裁剪
+    ys, xs = np.where(chip_mask > 0)
+    if len(xs) == 0:
+        raise RuntimeError("chip alpha 全 0")
+    cx0, cx1 = int(xs.min()), int(xs.max()) + 1
+    cy0, cy1 = int(ys.min()), int(ys.max()) + 1
+    chip_gray = chip_gray[cy0:cy1, cx0:cx1]
+    chip_mask = chip_mask[cy0:cy1, cx0:cx1]
 
     ph, pw = chip_gray.shape
     H, W = bg_gray.shape
+    if H < ph or W < pw:
+        raise RuntimeError(f"chip 比 bg 还大: bg={bg_gray.shape} chip={chip_gray.shape}")
+
+    mask_sum = float(chip_mask.sum())
+    if mask_sum < 100:
+        raise RuntimeError("chip 掩码太小")
+
+    chip_mean = float((chip_gray * chip_mask).sum() / mask_sum)
+    chip_centered = (chip_gray - chip_mean) * chip_mask
+    chip_std = float(np.sqrt((chip_centered ** 2).sum() / mask_sum))
+    if chip_std < 1e-6:
+        raise RuntimeError("chip 无对比度")
+    chip_norm = chip_centered / chip_std
+
     py = int(meta.get("py", 0))
-    y0 = max(0, py - 20)
-    y1 = min(H - ph + 1, py + ph + 20)
+    y0 = max(0, py - 10)
+    y1 = min(H - ph + 1, py + ph + 10)
     if y1 <= y0:
         y0, y1 = 0, H - ph + 1
 
-    mask_f = chip_mask.astype(np.float32)
-    msum = float(mask_f.sum())
-    chip_f = chip_gray.astype(np.float32)
-    cmean = float((chip_f * mask_f).sum() / msum)
-    ccentered = (chip_f - cmean) * mask_f
-    cstd = float(np.sqrt((ccentered ** 2).sum() / msum))
-    if cstd < 1e-6:
-        raise RuntimeError("chip 无对比度")
-    cnorm = ccentered / cstd
+    best_score, best_x, best_y = -1.0, 0, py
 
-    best_score, best_x, best_y = -1.0, 0, y0
     for y in range(y0, y1):
-        roi = bg_gray[y:y + ph, :].astype(np.float32)
-        wins = sliding_window_view(roi, (ph, pw))
-        weighted = wins * mask_f
-        means = weighted.sum(axis=(1, 2)) / msum
-        centered = (wins - means[:, None, None]) * mask_f
-        stds = np.sqrt((centered ** 2).sum(axis=(1, 2)) / msum) + 1e-6
-        ncc = (centered * cnorm[None, :, :]).sum(axis=(1, 2)) / (stds * msum)
+        roi = bg_gray[y:y + ph, :]                     # (ph, W)
+        wins = sliding_window_view(roi, (ph, pw))[0]   # (W-pw+1, ph, pw)
+        weighted = wins * chip_mask
+        means = weighted.sum(axis=(1, 2)) / mask_sum   # (W-pw+1,)
+        centered = (wins - means[:, None, None]) * chip_mask
+        stds = np.sqrt((centered ** 2).sum(axis=(1, 2)) / mask_sum) + 1e-6
+        ncc = (centered * chip_norm[None, :, :]).sum(axis=(1, 2)) / (stds * mask_sum)
         idx = int(np.argmax(ncc))
-        if ncc[idx] > best_score:
-            best_score = float(ncc[idx])
+        score = float(ncc[idx])
+        if score > best_score:
+            best_score = score
             best_x = idx
             best_y = y
 
@@ -392,7 +390,7 @@ def _solve_puzzle(bg_bytes, chip_bytes, meta):
 def _solve_rotate(bg_bytes, chip_bytes, meta, tag=""):
     """
     rotate：chip 固定在 (ox,oy,ow,oh)，绕中心旋转。
-    在固定位置扫描角度，用掩码 NCC 打分。
+    固定位置扫描角度，掩码 NCC 打分。
     返回 CSS 顺时针度数 = (360 - 逆时针角) % 360。
     """
     bg = _decode(bg_bytes)
@@ -479,7 +477,6 @@ def _solve_rotate(bg_bytes, chip_bytes, meta, tag=""):
     best_rot = best_rot_m = None
     best_px = best_py = 0
 
-    # 粗扫 3°
     for angle in range(0, 360, 3):
         s, rot, rot_m, px, py = _score_angle(angle)
         if s > best_score:
@@ -487,7 +484,6 @@ def _solve_rotate(bg_bytes, chip_bytes, meta, tag=""):
             best_rot, best_rot_m = rot, rot_m
             best_px, best_py = px, py
 
-    # 精扫 ±2°
     for da in (-2, -1, 1, 2):
         angle = (best_angle + da) % 360
         s, rot, rot_m, px, py = _score_angle(angle)
@@ -498,7 +494,6 @@ def _solve_rotate(bg_bytes, chip_bytes, meta, tag=""):
 
     print(f"   🎯 rotate: 逆时针={best_angle}° ncc={best_score:.3f}")
 
-    # 保存可视化
     try:
         if best_rot is not None:
             vis = cv2.cvtColor(target, cv2.COLOR_GRAY2BGR)
@@ -520,7 +515,6 @@ def _solve_rotate(bg_bytes, chip_bytes, meta, tag=""):
 
 
 def _solve_odd(bg_bytes, meta):
-    """odd：找颜色/纹理最不合群的那个 item，返回其索引。"""
     bg = _decode(bg_bytes)
     if bg is None:
         return None
@@ -558,7 +552,7 @@ def _solve_odd(bg_bytes, meta):
     return best_i if best_i >= 0 else None
 
 
-# ================= 交互动作 =================
+# ================= 交互 =================
 
 def _click_box_at(page, meta, ix, iy):
     box = page.locator("#captcha_box_default").bounding_box()
@@ -574,13 +568,7 @@ def _click_box_at(page, meta, ix, iy):
 
 
 def _drag_slider(page, value, vmax):
-    """
-    与组件 trackToValue 对齐：
-      frac = (clientX - track.left - hw/2) / (track.width - hw)
-      value = frac * vmax
-    反解：
-      clientX = track.left + hw/2 + (value/vmax) * (track.width - hw)
-    """
+    """与组件 trackToValue 对齐。"""
     track = page.locator("#captcha_track_default")
     track.wait_for(state="visible", timeout=5000)
     box = track.bounding_box()
@@ -625,17 +613,15 @@ def _drag_slider(page, value, vmax):
 
 def _handle_one_stage(page, meta, frames, tag=""):
     """
-    返回：
-      True      -> 已提交，等主循环处理响应
-      "switched"-> 已切换类型，主循环重新取 meta
-      False     -> 无法处理
+    True      -> 已提交
+    "switched"-> 已切换类型
+    False     -> 无法处理
     """
     kind = meta.get("kind")
     alt = meta.get("alt")
     print(f"   🎯 kind={kind} nf={meta.get('nf')} "
           f"stage={meta.get('stage')}/{meta.get('stages')} alt={alt}")
 
-    # 难题自动切换
     if kind not in PREFERRED_KINDS and alt in PREFERRED_KINDS:
         try:
             btn = page.locator("#captcha_switch_default").first
@@ -707,7 +693,6 @@ def _try_renew_session(page, attempt, initial_days):
         print(f"   ❌ 未找到续期按钮: {e}")
         return None
 
-    # 等 captcha 数据可用
     ok = False
     for _ in range(80):
         if WS_STATE["meta"] and WS_STATE["meta"].get("id"):
@@ -728,7 +713,6 @@ def _try_renew_session(page, attempt, initial_days):
     while time.time() - start < max_total:
         resp = WS_STATE["last_resp"]
 
-        # ---- 终点 ----
         if resp and resp.startswith("ok:"):
             token = resp[3:]
             print(f"   🎉 全部通过！token 长度={len(token)}")
@@ -771,7 +755,6 @@ def _try_renew_session(page, attempt, initial_days):
             print(f"   ❌ bot: {resp}")
             return None
 
-        # ---- 拿 meta ----
         meta = WS_STATE["meta"]
         if not meta or not meta.get("id"):
             page.wait_for_timeout(300)
@@ -812,7 +795,6 @@ def _try_renew_session(page, attempt, initial_days):
             if switch_count > MAX_SWITCH_PER_SESSION:
                 print("   ⚠️ 切换次数过多，退出")
                 return None
-            # 等新 meta
             page.wait_for_timeout(800)
             continue
 
@@ -898,7 +880,7 @@ def get_vps_urls(page):
 
 def main():
     print("#" * 50)
-    print("   Openworld VPS 自动续期 (v10)")
+    print("   Openworld VPS 自动续期 (v11)")
     print("#" * 50)
 
     if not DISCORD_TOKEN:
