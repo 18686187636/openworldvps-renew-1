@@ -30,7 +30,8 @@ SITE_BASE     = "https://openworld.eu.org"
 RENEW_THRESHOLD_DAYS = 5
 SCREENSHOT_DIR = os.environ.get("SCREENSHOT_DIR", ".")
 
-PREFERRED_KINDS = ("puzzle", "odd")
+# puzzle / key 会优先；其他类型如果 alt 在偏好列表里也会切换过去
+PREFERRED_KINDS = ("puzzle", "key", "odd")
 MAX_SWITCH_PER_SESSION = 6
 # ==========================================
 
@@ -79,7 +80,6 @@ def _reset_ws_state():
 
 def _install_ws_hook(page):
     def on_ws(ws):
-        # 忽略本机 Discord 客户端探测端口，只关心 openworld 的 captcha WS
         if "openworld.eu.org" not in ws.url:
             return
         WS_STATE["url"] = ws.url
@@ -320,79 +320,120 @@ def _decode(b):
     return cv2.imdecode(np.frombuffer(b, np.uint8), cv2.IMREAD_UNCHANGED)
 
 
+def _chip_shape(chip):
+    """从 chip 的 alpha 提取形状描述。返回 (w, h, circularity, n_vert, alpha_crop)。"""
+    alpha = chip[:, :, 3]
+    ys, xs = np.where(alpha > 200)
+    if len(xs) == 0:
+        return None
+    cx0, cx1 = int(xs.min()), int(xs.max()) + 1
+    cy0, cy1 = int(ys.min()), int(ys.max()) + 1
+    a = alpha[cy0:cy1, cx0:cx1]
+    _, th = cv2.threshold(a, 200, 255, cv2.THRESH_BINARY)
+    cnts, _ = cv2.findContours(th, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if not cnts:
+        return None
+    cnt = max(cnts, key=cv2.contourArea)
+    area = cv2.contourArea(cnt)
+    peri = cv2.arcLength(cnt, True)
+    circ = 4 * np.pi * area / (peri * peri) if peri > 0 else 0
+    approx = cv2.approxPolyDP(cnt, 0.04 * peri, True)
+    return {
+        "w": cx1 - cx0,
+        "h": cy1 - cy0,
+        "circ": circ,
+        "nv": len(approx),
+    }
+
+
+def _bg_black_shapes(bg_gray):
+    """找 bg 上所有黑色连通域，返回候选列表。"""
+    _, th = cv2.threshold(bg_gray, 40, 255, cv2.THRESH_BINARY_INV)
+    kernel = np.ones((3, 3), np.uint8)
+    th = cv2.morphologyEx(th, cv2.MORPH_CLOSE, kernel, iterations=1)
+    contours, _ = cv2.findContours(th, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+    out = []
+    for cnt in contours:
+        x, y, w, h = cv2.boundingRect(cnt)
+        area = cv2.contourArea(cnt)
+        if w < 40 or h < 40 or area < 1500:
+            continue
+        peri = cv2.arcLength(cnt, True)
+        if peri < 1:
+            continue
+        circ = 4 * np.pi * area / (peri * peri)
+        approx = cv2.approxPolyDP(cnt, 0.04 * peri, True)
+        out.append({
+            "bbox": (x, y, w, h),
+            "circ": circ,
+            "nv": len(approx),
+            "area": area,
+        })
+    return out
+
+
 def _solve_puzzle(bg_bytes, chip_bytes, meta):
-    """puzzle/key：向量化 NCC 滑窗，找 chip 左边缘在 bg 上的 x 位置。"""
+    """
+    puzzle/key：bg 上有 3 个黑色形状（三角/方/圆），
+    chip 是其中一个形状的彩色版本，要拖到同形状的黑块上。
+    匹配：形状相似度 60% + 尺寸相似度 40%。
+    """
     bg = _decode(bg_bytes)
     chip = _decode(chip_bytes)
     if bg is None or chip is None:
         raise RuntimeError("解码失败")
     bg_rgb = bg[:, :, :3] if bg.ndim == 3 else cv2.cvtColor(bg, cv2.COLOR_GRAY2BGR)
-    bg_gray = cv2.cvtColor(bg_rgb, cv2.COLOR_BGR2GRAY).astype(np.float32)
+    bg_gray = cv2.cvtColor(bg_rgb, cv2.COLOR_BGR2GRAY)
 
     if chip.ndim != 3 or chip.shape[2] != 4:
         raise RuntimeError("chip 缺少 alpha")
-    chip_gray = cv2.cvtColor(chip[:, :, :3], cv2.COLOR_BGR2GRAY).astype(np.float32)
-    chip_mask = (chip[:, :, 3] > 100).astype(np.float32)
 
-    # 按 alpha 内容框裁剪
-    ys, xs = np.where(chip_mask > 0)
-    if len(xs) == 0:
-        raise RuntimeError("chip alpha 全 0")
-    cx0, cx1 = int(xs.min()), int(xs.max()) + 1
-    cy0, cy1 = int(ys.min()), int(ys.max()) + 1
-    chip_gray = chip_gray[cy0:cy1, cx0:cx1]
-    chip_mask = chip_mask[cy0:cy1, cx0:cx1]
+    chip_info = _chip_shape(chip)
+    if chip_info is None:
+        raise RuntimeError("chip 轮廓为空")
+    chip_w, chip_h = chip_info["w"], chip_info["h"]
+    chip_circ, chip_nv = chip_info["circ"], chip_info["nv"]
+    print(f"   📐 chip: {chip_w}x{chip_h} circ={chip_circ:.2f} nv={chip_nv}")
 
-    ph, pw = chip_gray.shape
-    H, W = bg_gray.shape
-    if H < ph or W < pw:
-        raise RuntimeError(f"chip 比 bg 还大: bg={bg_gray.shape} chip={chip_gray.shape}")
+    candidates = _bg_black_shapes(bg_gray)
+    if not candidates:
+        raise RuntimeError("bg 上未找到黑色形状")
+    print(f"   🔍 bg 上检测到 {len(candidates)} 个形状:")
+    for c in candidates:
+        print(f"      bbox={c['bbox']} circ={c['circ']:.2f} nv={c['nv']}")
 
-    mask_sum = float(chip_mask.sum())
-    if mask_sum < 100:
-        raise RuntimeError("chip 掩码太小")
+    best, best_score = None, -1.0
+    for c in candidates:
+        bw, bh = c["bbox"][2], c["bbox"][3]
+        size_score = 1.0 - min(1.0, abs(bw - chip_w) + abs(bh - chip_h)) / 100.0
 
-    chip_mean = float((chip_gray * chip_mask).sum() / mask_sum)
-    chip_centered = (chip_gray - chip_mean) * chip_mask
-    chip_std = float(np.sqrt((chip_centered ** 2).sum() / mask_sum))
-    if chip_std < 1e-6:
-        raise RuntimeError("chip 无对比度")
-    chip_norm = chip_centered / chip_std
+        if chip_circ > 0.72:
+            shape_score = 1.0 if c["circ"] > 0.72 else 0.1
+        elif chip_nv == 3:
+            shape_score = 1.0 if c["nv"] == 3 else 0.1
+        elif chip_nv == 4:
+            shape_score = 1.0 if c["nv"] == 4 else 0.1
+        else:
+            shape_score = 1.0 - abs(c["circ"] - chip_circ)
 
-    py = int(meta.get("py", 0))
-    y0 = max(0, py - 10)
-    y1 = min(H - ph + 1, py + ph + 10)
-    if y1 <= y0:
-        y0, y1 = 0, H - ph + 1
-
-    best_score, best_x, best_y = -1.0, 0, py
-
-    for y in range(y0, y1):
-        roi = bg_gray[y:y + ph, :]                     # (ph, W)
-        wins = sliding_window_view(roi, (ph, pw))[0]   # (W-pw+1, ph, pw)
-        weighted = wins * chip_mask
-        means = weighted.sum(axis=(1, 2)) / mask_sum   # (W-pw+1,)
-        centered = (wins - means[:, None, None]) * chip_mask
-        stds = np.sqrt((centered ** 2).sum(axis=(1, 2)) / mask_sum) + 1e-6
-        ncc = (centered * chip_norm[None, :, :]).sum(axis=(1, 2)) / (stds * mask_sum)
-        idx = int(np.argmax(ncc))
-        score = float(ncc[idx])
+        score = 0.6 * shape_score + 0.4 * size_score
+        print(f"      → shape={shape_score:.2f} size={size_score:.2f} total={score:.2f}")
         if score > best_score:
-            best_score = score
-            best_x = idx
-            best_y = y
+            best_score, best = score, c
 
-    print(f"   🧪 NCC: best=({best_x},{best_y}) score={best_score:.3f} (py={py})")
-    vmax = int(meta.get("vmax") or W)
-    return max(0, min(vmax, best_x))
+    if best is None or best_score < 0.3:
+        raise RuntimeError(f"无匹配形状 (best_score={best_score:.2f})")
+
+    x, y, w, h = best["bbox"]
+    print(f"   🎯 选中 bbox=({x},{y},{w},{h}) score={best_score:.2f}")
+
+    vmax = int(meta.get("vmax") or 300)
+    return max(0, min(vmax, x))
 
 
 def _solve_rotate(bg_bytes, chip_bytes, meta, tag=""):
-    """
-    rotate：chip 固定在 (ox,oy,ow,oh)，绕中心旋转。
-    固定位置扫描角度，掩码 NCC 打分。
-    返回 CSS 顺时针度数 = (360 - 逆时针角) % 360。
-    """
+    """rotate：chip 固定在 (ox,oy,ow,oh) 绕中心旋转，需要转到正确朝向。"""
     bg = _decode(bg_bytes)
     chip = _decode(chip_bytes)
     if bg is None or chip is None:
@@ -436,11 +477,10 @@ def _solve_rotate(bg_bytes, chip_bytes, meta, tag=""):
 
     ch, cw = chip_gray.shape
     ccx, ccy = cw / 2.0, ch / 2.0
-
     tgt_cx = (ox + ow / 2.0) - x0
     tgt_cy = (oy + oh / 2.0) - y0
 
-    def _score_angle(angle):
+    def _score(angle):
         M = cv2.getRotationMatrix2D((ccx, ccy), angle, 1.0)
         cos_a, sin_a = abs(M[0, 0]), abs(M[0, 1])
         nw = int(np.ceil(ch * sin_a + cw * cos_a))
@@ -453,13 +493,11 @@ def _solve_rotate(bg_bytes, chip_bytes, meta, tag=""):
                                flags=cv2.INTER_NEAREST, borderValue=0)
         px = int(round(tgt_cx - nw / 2.0))
         py = int(round(tgt_cy - nh / 2.0))
-
-        tx0 = max(0, px); ty0 = max(0, py)
-        tx1 = min(tw, px + nw); ty1 = min(th, py + nh)
+        tx0, ty0 = max(0, px), max(0, py)
+        tx1, ty1 = min(tw, px + nw), min(th, py + nh)
         if tx1 <= tx0 or ty1 <= ty0:
             return -1.0, rot, rot_m, px, py
-
-        rx0 = tx0 - px; ry0 = ty0 - py
+        rx0, ry0 = tx0 - px, ty0 - py
         rx1 = rx0 + (tx1 - tx0); ry1 = ry0 + (ty1 - ty0)
         a = target[ty0:ty1, tx0:tx1].astype(np.float32)
         b = rot[ry0:ry1, rx0:rx1].astype(np.float32)
@@ -478,15 +516,14 @@ def _solve_rotate(bg_bytes, chip_bytes, meta, tag=""):
     best_px = best_py = 0
 
     for angle in range(0, 360, 3):
-        s, rot, rot_m, px, py = _score_angle(angle)
+        s, rot, rot_m, px, py = _score(angle)
         if s > best_score:
             best_score, best_angle = s, angle
             best_rot, best_rot_m = rot, rot_m
             best_px, best_py = px, py
-
     for da in (-2, -1, 1, 2):
         angle = (best_angle + da) % 360
-        s, rot, rot_m, px, py = _score_angle(angle)
+        s, rot, rot_m, px, py = _score(angle)
         if s > best_score:
             best_score, best_angle = s, angle
             best_rot, best_rot_m = rot, rot_m
@@ -568,7 +605,6 @@ def _click_box_at(page, meta, ix, iy):
 
 
 def _drag_slider(page, value, vmax):
-    """与组件 trackToValue 对齐。"""
     track = page.locator("#captcha_track_default")
     track.wait_for(state="visible", timeout=5000)
     box = track.bounding_box()
@@ -880,7 +916,7 @@ def get_vps_urls(page):
 
 def main():
     print("#" * 50)
-    print("   Openworld VPS 自动续期 (v11)")
+    print("   Openworld VPS 自动续期 (v12 - 形状匹配)")
     print("#" * 50)
 
     if not DISCORD_TOKEN:
