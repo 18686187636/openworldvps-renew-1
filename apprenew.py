@@ -34,7 +34,7 @@ SCREENSHOT_DIR = os.environ.get("SCREENSHOT_DIR", ".")
 os.makedirs(SCREENSHOT_DIR, exist_ok=True)
 
 
-# ================= 反自动化 + WebSocket Hook =================
+# ================= 反自动化 JS（只做伪装，不抓 WebSocket） =================
 STEALTH_JS = r"""
 (function() {
   try { Object.defineProperty(navigator, 'webdriver', { get: () => false }); } catch(e) {}
@@ -67,81 +67,77 @@ STEALTH_JS = r"""
     }
   } catch(e) {}
   try { delete document.$cdc_asdjflasutopfhvcZLmcfl_; } catch(e) {}
-
-  // ---- Hook WebSocket ----
-  var OrigWS = window.WebSocket;
-  // __ow 是一个持久化的收集器，不随新的挑战重置
-  window.__ow = {
-    meta: null,
-    metaId: null,
-    frames: [],
-    lastResp: null,
-    sent: [],
-    closed: false,
-    closeCode: null,
-    ws_refs: []
-  };
-
-  function OWWS(url, protocols) {
-    var ws = (protocols === undefined) ? new OrigWS(url) : new OrigWS(url, protocols);
-    try { window.__ow.ws_refs.push(ws); } catch(e) {}
-    try { window.__ow.closed = false; window.__ow.closeCode = null; } catch(e) {}
-
-    ws.addEventListener('message', function(ev) {
-      if (typeof ev.data === 'string') {
-        window.__ow.lastResp = ev.data;
-        try {
-          var m = JSON.parse(ev.data);
-          if (m && m.id && m.nf) {
-            // 关键修复：只在 meta.id 变化时重置 frames
-            // 避免服务端先推帧、后到 meta 时清掉已到帧
-            if (m.id !== window.__ow.metaId) {
-              window.__ow.metaId = m.id;
-              window.__ow.meta = m;
-              window.__ow.frames = [];
-            } else {
-              // 同一 id 的 meta 重复到达，只更新 meta 内容
-              window.__ow.meta = m;
-            }
-          }
-        } catch(e) {}
-      } else {
-        // 二进制帧：只接受当前 meta 对应 id 的帧
-        (function(d) {
-          (function() {
-            if (d instanceof ArrayBuffer) return Promise.resolve(d);
-            return d.arrayBuffer();
-          })().then(function(ab) {
-            var bytes = new Uint8Array(ab);
-            var bin = '';
-            var CH = 0x8000;
-            for (var i = 0; i < bytes.length; i += CH) {
-              bin += String.fromCharCode.apply(null, bytes.subarray(i, i + CH));
-            }
-            window.__ow.frames.push(btoa(bin));
-          }).catch(function(){});
-        })(ev.data);
-      }
-    });
-
-    ws.addEventListener('close', function(e) {
-      window.__ow.closed = true;
-      window.__ow.closeCode = e.code;
-    });
-
-    var origSend = ws.send.bind(ws);
-    ws.send = function(d) {
-      try { window.__ow.sent.push(typeof d === 'string' ? d : '[bin]'); } catch(e) {}
-      return origSend(d);
-    };
-
-    return ws;
-  }
-  OWWS.prototype = OrigWS.prototype;
-  OWWS.CONNECTING = 0; OWWS.OPEN = 1; OWWS.CLOSING = 2; OWWS.CLOSED = 3;
-  window.WebSocket = OWWS;
 })();
 """
+
+
+# ================= Playwright 原生 WebSocket 状态 =================
+WS_STATE = {
+    "url": None,
+    "meta": None,
+    "frames": [],       # List[bytes]
+    "last_resp": None,
+    "sent": [],
+    "closed": False,
+}
+
+
+def _reset_ws_state():
+    WS_STATE["url"] = None
+    WS_STATE["meta"] = None
+    WS_STATE["frames"] = []
+    WS_STATE["last_resp"] = None
+    WS_STATE["sent"] = []
+    WS_STATE["closed"] = False
+
+
+def _install_ws_hook(page):
+    """用 Playwright 原生 WebSocket 事件捕获，不依赖 JS 注入。"""
+    def on_ws(ws):
+        WS_STATE["url"] = ws.url
+        WS_STATE["closed"] = False
+        print(f"   🔌 WebSocket 已连接: {ws.url}")
+
+        def on_sent(payload):
+            try:
+                if isinstance(payload, (bytes, bytearray)):
+                    WS_STATE["sent"].append(f"[bin:{len(payload)}]")
+                else:
+                    s = str(payload)
+                    WS_STATE["sent"].append(s[:200])
+                    print(f"   ➡️ 发送: {s[:120]}")
+            except Exception:
+                pass
+
+        def on_recv(payload):
+            try:
+                if isinstance(payload, (bytes, bytearray)):
+                    print(f"   ⬅️ 收到二进制: {len(payload)} bytes")
+                    WS_STATE["frames"].append(bytes(payload))
+                else:
+                    s = str(payload)
+                    WS_STATE["last_resp"] = s
+                    print(f"   ⬅️ 收到文本: {s[:200]}")
+                    try:
+                        m = json.loads(s)
+                        if isinstance(m, dict) and m.get("id") and m.get("nf"):
+                            # 协议约定：新 meta 到达即代表新挑战，旧帧作废
+                            WS_STATE["meta"] = m
+                            WS_STATE["frames"] = []
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+
+        def on_close():
+            WS_STATE["closed"] = True
+            print(f"   🔒 WebSocket 已关闭")
+
+        ws.on("framesent", on_sent)
+        ws.on("framereceived", on_recv)
+        ws.on("close", on_close)
+
+    page.on("websocket", on_ws)
 
 
 # ================= 通用工具 =================
@@ -376,7 +372,6 @@ def login_with_discord_token(page, dc_token: str) -> bool:
     print(f"   Client ID:    {client_id}")
     print(f"   Redirect URI: {redirect_uri}")
     print(f"   Scope:        {scope}")
-    print(f"   State:        {state[:20]}..." if state else "   State:        (空)")
 
     if not client_id or not redirect_uri:
         print("   ❌ 无法解析关键 OAuth 参数")
@@ -465,54 +460,35 @@ def login_with_discord_token(page, dc_token: str) -> bool:
 
 # ================= 拼图滑块验证码 =================
 
-def _reset_ow(page):
-    """
-    重置 __ow 状态。
-    关键修复：metaId 一并清空，强制下一次 meta 到达时清空 frames。
-    """
-    try:
-        page.evaluate("""() => {
-            if (!window.__ow) {
-                window.__ow = { meta: null, metaId: null, frames: [],
-                                lastResp: null, sent: [], closed: false,
-                                closeCode: null, ws_refs: [] };
-                return;
-            }
-            window.__ow.meta = null;
-            window.__ow.metaId = null;
-            window.__ow.frames = [];
-            window.__ow.lastResp = null;
-            window.__ow.sent = [];
-        }""")
-    except Exception:
-        pass
-
-
-def _read_ow_state(page):
-    return page.evaluate("""() => ({
-        meta: window.__ow ? window.__ow.meta : null,
-        metaId: window.__ow ? window.__ow.metaId : null,
-        frames: window.__ow ? window.__ow.frames : [],
-        lastResp: window.__ow ? window.__ow.lastResp : null,
-        sent: window.__ow ? window.__ow.sent : [],
-        closed: window.__ow ? window.__ow.closed : false,
-        closeCode: window.__ow ? window.__ow.closeCode : null,
-    })""")
-
-
-def _wait_captcha_ready(page, timeout=25):
-    """
-    一步等待 meta + 所有帧到齐。
-    用单个 wait_for_function 避免中间态竞争。
-    """
-    page.wait_for_function(
-        """() => {
-            const o = window.__ow;
-            if (!o || !o.meta || !o.meta.id) return false;
-            const nf = o.meta.nf || 1;
-            return Array.isArray(o.frames) && o.frames.length >= nf;
-        }""",
-        timeout=timeout * 1000,
+def _wait_captcha_ready(page, timeout=25, verbose=True):
+    """轮询 Python 侧 WS_STATE，等 meta + 所有帧到齐。"""
+    start = time.time()
+    last_print = 0
+    while time.time() - start < timeout:
+        meta = WS_STATE["meta"]
+        n_frames = len(WS_STATE["frames"])
+        if meta and meta.get("id"):
+            nf = int(meta.get("nf") or 1)
+            if n_frames >= nf:
+                if verbose:
+                    print(f"   ✅ captcha 就绪: id={meta.get('id')[:8]}..., "
+                          f"nf={nf}, kind={meta.get('kind')}")
+                return True
+        now = time.time()
+        if verbose and now - last_print > 5:
+            last_print = now
+            print(f"   ⏳ 等待 captcha: meta={'有' if meta else '无'} "
+                  f"frames={n_frames} lastResp={WS_STATE['last_resp']!r} "
+                  f"ws_url={WS_STATE['url']}")
+        page.wait_for_timeout(200)
+    raise TimeoutError(
+        f"等待 captcha 超时 (timeout={timeout}s)\n"
+        f"      meta={WS_STATE['meta']}\n"
+        f"      frames_len={len(WS_STATE['frames'])}\n"
+        f"      last_resp={WS_STATE['last_resp']!r}\n"
+        f"      sent={WS_STATE['sent']}\n"
+        f"      ws_url={WS_STATE['url']}\n"
+        f"      closed={WS_STATE['closed']}"
     )
 
 
@@ -610,68 +586,50 @@ def _drag_slider(page, value: int, vmax: int):
 
 
 def _wait_captcha_result(page, timeout=15):
-    try:
-        page.wait_for_function(
-            """() => {
-                const r = window.__ow.lastResp || '';
-                return r.startsWith('ok:') || r === 'fail' || r === 'burned' ||
-                       r === 'blocked' || r.startsWith('bot:') || r === 'rate';
-            }""",
-            timeout=timeout * 1000,
-        )
-    except Exception:
-        return None
-    return page.evaluate("() => window.__ow.lastResp")
+    start = time.time()
+    while time.time() - start < timeout:
+        r = WS_STATE["last_resp"]
+        if r:
+            if r.startswith("ok:") or r in ("fail", "burned", "blocked", "rate"):
+                return r
+            if r.startswith("bot:"):
+                return r
+        page.wait_for_timeout(200)
+    return None
 
 
 def _try_renew_once(page, attempt: int, initial_days: int):
-    """单次尝试。返回 True=成功 / False=应放弃 / None=继续重试。"""
+    """单次尝试。返回 True=成功 / None=继续重试。"""
     print(f"\n   {'='*40}\n   🔄 第 {attempt} 次尝试\n   {'='*40}")
 
-    # 1. 先重置 __ow 状态（关键修复：在点击前重置）
-    _reset_ow(page)
-
-    # 2. 点击 Renew free
+    # 1. 尝试打开弹窗（页面加载时 captcha 已自动初始化，这里只是显示弹窗）
     try:
         btn = page.locator("button:has-text('Renew free')").first
-        btn.wait_for(state="visible", timeout=8000)
-        btn.click()
-        print("   ✅ 已点击 Renew free")
+        if btn.is_visible(timeout=3000):
+            btn.click()
+            print("   ✅ 已点击 Renew free，弹窗打开")
+        else:
+            print("   ℹ️ Renew free 按钮不可见，可能弹窗已打开")
     except Exception as e:
-        print(f"   ❌ 未找到续期按钮: {e}")
-        return None
+        print(f"   ⚠️ 点击 Renew free 异常: {e}")
 
-    # 3. 一步等待 meta + frames 全部就绪
+    # 2. 等待 meta + frames（Python 侧 WS_STATE）
     try:
         _wait_captcha_ready(page, timeout=25)
-    except Exception as e:
-        print(f"   ❌ 等待 captcha meta/frames 超时: {e}")
-        # 打印详细诊断
-        try:
-            st = _read_ow_state(page)
-            meta = st.get("meta")
-            print(f"   🔬 诊断：")
-            print(f"      meta = {json.dumps(meta, ensure_ascii=False) if meta else None}")
-            print(f"      metaId = {st.get('metaId')}")
-            print(f"      frames_len = {len(st.get('frames') or [])}")
-            print(f"      lastResp = {st.get('lastResp')!r}")
-            print(f"      sent = {st.get('sent')}")
-            print(f"      closed = {st.get('closed')}, closeCode = {st.get('closeCode')}")
-        except Exception:
-            pass
+    except TimeoutError as e:
+        print(f"   ❌ {e}")
         dump_page_debug(page, f"no_meta_{attempt}")
         return None
 
-    # 4. 读取状态
-    st = _read_ow_state(page)
-    meta = st["meta"]
+    meta = WS_STATE["meta"]
     kind = meta.get("kind")
-    nf = meta.get("nf")
+    nf = int(meta.get("nf") or 1)
+    frames_all = list(WS_STATE["frames"])[:nf]
     print(f"   📋 kind={kind} nf={nf} w={meta.get('w')} h={meta.get('h')} "
           f"vmax={meta.get('vmax')} pw={meta.get('pw')} py={meta.get('py')}")
 
-    frames = [base64.b64decode(b) for b in st["frames"]]
-    for i, fb in enumerate(frames):
+    # 保存帧供调试
+    for i, fb in enumerate(frames_all):
         try:
             with open(os.path.join(SCREENSHOT_DIR,
                                    f"captcha_a{attempt}_f{i}.png"), "wb") as f:
@@ -682,26 +640,26 @@ def _try_renew_once(page, attempt: int, initial_days: int):
     if kind != "puzzle":
         print(f"   ⚠️ 本轮 kind={kind}，暂只实现 puzzle")
         return None
-    if nf < 2:
-        print(f"   ⚠️ nf={nf}，缺少拼图块帧")
+    if nf < 2 or len(frames_all) < 2:
+        print(f"   ⚠️ nf={nf} 或帧不足，无法求解")
         return None
 
-    # 5. 求解
+    # 3. 求解
     try:
-        value = _solve_puzzle(frames[0], frames[1], meta)
+        value = _solve_puzzle(frames_all[0], frames_all[1], meta)
         print(f"   🧩 缺口估算 value={value} / vmax={meta.get('vmax')}")
     except Exception as e:
         print(f"   ❌ 拼图求解失败: {e}")
         return None
 
-    # 6. 拖动
+    # 4. 拖动
     try:
         _drag_slider(page, value, int(meta.get("vmax") or 300))
     except Exception as e:
         print(f"   ❌ 拖动滑块失败: {e}")
         return None
 
-    # 7. 读响应
+    # 5. 读响应
     resp = _wait_captcha_result(page, timeout=15)
     print(f"   📨 服务端响应: {resp!r}")
     if not resp or not resp.startswith("ok:"):
@@ -710,7 +668,7 @@ def _try_renew_once(page, attempt: int, initial_days: int):
     token = resp[3:]
     print(f"   ✅ 验证码通过，token 长度={len(token)}")
 
-    # 8. 确认续期
+    # 6. 确认续期
     try:
         confirm = page.locator("button:has-text('Confirm Renewal')").first
         confirm.wait_for(state="visible", timeout=5000)
@@ -719,7 +677,7 @@ def _try_renew_once(page, attempt: int, initial_days: int):
     except Exception as e:
         print(f"   ⚠️ 点击 Confirm Renewal 异常: {e}")
 
-    # 9. 验证
+    # 7. 验证
     page.wait_for_timeout(4000)
     try:
         page.reload(wait_until="domcontentloaded", timeout=30000)
@@ -762,6 +720,8 @@ def try_renew_captcha(page, initial_days: int, max_attempts=5) -> bool:
             return True
 
         if attempt < max_attempts:
+            # 刷新前先重置 WS 状态，避免读到旧的 meta/frames
+            _reset_ws_state()
             try:
                 page.keyboard.press("Escape")
                 page.wait_for_timeout(500)
@@ -839,7 +799,7 @@ def get_vps_urls(page) -> list:
 
 def main():
     print("#" * 50)
-    print("   Openworld VPS 自动续期脚本 (v4 - 修复帧收集)")
+    print("   Openworld VPS 自动续期脚本 (v5 - Playwright 原生 WS)")
     print("#" * 50)
 
     if not DISCORD_TOKEN:
@@ -869,6 +829,9 @@ def main():
         context.add_init_script(STEALTH_JS)
         page = context.new_page()
 
+        # ★ 关键：注册原生 WebSocket 监听
+        _install_ws_hook(page)
+
         try:
             success = login_with_discord_token(page, DISCORD_TOKEN)
             if not success:
@@ -887,6 +850,9 @@ def main():
                 print(f"\n{'=' * 50}")
                 print(f"📌 [{idx}/{len(target_vps_list)}] {target_url}")
                 print(f"{'=' * 50}")
+
+                # 每次进新 VPS 前重置 WS 状态
+                _reset_ws_state()
 
                 try:
                     page.goto(target_url, wait_until="domcontentloaded", timeout=30000)
