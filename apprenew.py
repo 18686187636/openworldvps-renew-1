@@ -5,7 +5,6 @@ import os
 import re
 import sys
 import json
-import base64
 import random
 import urllib.parse
 import requests
@@ -16,7 +15,6 @@ from playwright.sync_api import sync_playwright
 try:
     import numpy as np
     import cv2
-    from numpy.lib.stride_tricks import sliding_window_view
 except ImportError:
     print("❌ 缺少依赖：pip install numpy opencv-python-headless")
     sys.exit(1)
@@ -30,6 +28,10 @@ ACCOUNT_NAME  = os.environ.get("ACCOUNT_NAME", "未命名账号")
 SITE_BASE     = "https://openworld.eu.org"
 RENEW_THRESHOLD_DAYS = 5
 SCREENSHOT_DIR = os.environ.get("SCREENSHOT_DIR", ".")
+
+# 优先求解的类型；遇到别的类型如果 alt 在偏好里就切
+PREFERRED_KINDS = ("puzzle", "odd")
+MAX_SWITCH_PER_SESSION = 6
 # ==========================================
 
 os.makedirs(SCREENSHOT_DIR, exist_ok=True)
@@ -60,8 +62,14 @@ STEALTH_JS = r"""
 
 
 # ================= WebSocket 状态 =================
-WS_STATE = {"url": None, "meta": None, "frames": [], "last_resp": None,
-            "sent": [], "closed": False}
+WS_STATE = {
+    "url": None,
+    "meta": None,
+    "frames": [],
+    "last_resp": None,
+    "sent": [],
+    "closed": False,
+}
 
 
 def _reset_ws_state():
@@ -70,6 +78,7 @@ def _reset_ws_state():
 
 
 def _install_ws_hook(page):
+    """用 Playwright 原生 WebSocket 事件捕获 meta 和二进制帧。"""
     def on_ws(ws):
         WS_STATE["url"] = ws.url
         print(f"   🔌 WebSocket: {ws.url}")
@@ -161,7 +170,7 @@ def wait_for_cloudflare(page, timeout=15):
     return False
 
 
-# ================= Discord 登录 =================
+# ================= Discord OAuth 登录 =================
 
 def login_with_discord_token(page, dc_token: str) -> bool:
     print("=" * 50)
@@ -239,10 +248,10 @@ def login_with_discord_token(page, dc_token: str) -> bool:
 
     p = urllib.parse.urlparse(oauth_url)
     q = urllib.parse.parse_qs(p.query)
-    client_id = q.get("client_id", [""])[0]
-    redirect_uri = q.get("redirect_uri", [""])[0]
-    scope = q.get("scope", ["identify email"])[0]
-    state = q.get("state", [""])[0]
+    client_id     = q.get("client_id", [""])[0]
+    redirect_uri  = q.get("redirect_uri", [""])[0]
+    scope         = q.get("scope", ["identify email"])[0]
+    state         = q.get("state", [""])[0]
     response_type = q.get("response_type", ["code"])[0]
 
     if not client_id or not redirect_uri:
@@ -303,88 +312,89 @@ def login_with_discord_token(page, dc_token: str) -> bool:
     return True
 
 
-# ================= 求解器 =================
+# ================= 图片/求解工具 =================
 
 def _decode(b):
     return cv2.imdecode(np.frombuffer(b, np.uint8), cv2.IMREAD_UNCHANGED)
 
 
-def _ncc_match(bg_gray, chip_gray, mask, y_search):
-    """加权 NCC 滑窗。返回 (best_x, best_y, best_score)。"""
-    H, W = bg_gray.shape
+def _ncc_patch(target_gray, patch_gray, patch_mask):
+    """在 target 的固定位置（同尺寸）做加权 NCC。返回 score。"""
+    if target_gray.shape != patch_gray.shape:
+        return -1.0
+    m = patch_mask > 0
+    if m.sum() < 100:
+        return -1.0
+    a = target_gray[m].astype(np.float32)
+    b = patch_gray[m].astype(np.float32)
+    a = a - a.mean()
+    b = b - b.mean()
+    d = float(np.sqrt((a * a).sum()) * np.sqrt((b * b).sum()))
+    if d < 1e-6:
+        return -1.0
+    return float((a * b).sum() / d)
+
+
+def _solve_puzzle(bg_bytes, chip_bytes, meta):
+    """puzzle/key：滑动匹配 chip 在 bg 上的位置，返回 value（= x 坐标）。"""
+    from numpy.lib.stride_tricks import sliding_window_view
+
+    bg = _decode(bg_bytes)
+    chip = _decode(chip_bytes)
+    if bg is None or chip is None:
+        raise RuntimeError("解码失败")
+    bg_rgb = bg[:, :, :3] if bg.ndim == 3 else cv2.cvtColor(bg, cv2.COLOR_GRAY2BGR)
+    bg_gray = cv2.cvtColor(bg_rgb, cv2.COLOR_BGR2GRAY)
+
+    if chip.ndim != 3 or chip.shape[2] != 4:
+        raise RuntimeError("chip 缺少 alpha")
+    chip_gray = cv2.cvtColor(chip[:, :, :3], cv2.COLOR_BGR2GRAY)
+    chip_mask = (chip[:, :, 3] > 100).astype(np.uint8)
+
     ph, pw = chip_gray.shape
-    if W < pw or H < ph:
-        return 0, 0, -1.0
-
-    y0, y1 = y_search
-    y0 = max(0, int(y0))
-    y1 = min(H - ph + 1, int(y1))
+    H, W = bg_gray.shape
+    py = int(meta.get("py", 0))
+    y0 = max(0, py - 20)
+    y1 = min(H - ph + 1, py + ph + 20)
     if y1 <= y0:
-        return 0, 0, -1.0
+        y0, y1 = 0, H - ph + 1
 
-    mask_f = mask.astype(np.float32)
-    mask_sum = float(mask_f.sum())
-    if mask_sum < 1:
-        return 0, 0, -1.0
-
+    mask_f = chip_mask.astype(np.float32)
+    msum = float(mask_f.sum())
     chip_f = chip_gray.astype(np.float32)
-    chip_mean = float((chip_f * mask_f).sum() / mask_sum)
-    chip_centered = (chip_f - chip_mean) * mask_f
-    chip_std = float(np.sqrt((chip_centered ** 2).sum() / mask_sum))
-    if chip_std < 1e-6:
-        return 0, 0, -1.0
-    chip_norm = chip_centered / chip_std  # (ph, pw)
+    cmean = float((chip_f * mask_f).sum() / msum)
+    ccentered = (chip_f - cmean) * mask_f
+    cstd = float(np.sqrt((ccentered ** 2).sum() / msum))
+    if cstd < 1e-6:
+        raise RuntimeError("chip 无对比度")
+    cnorm = ccentered / cstd
 
-    best_score = -1.0
-    best_x = 0
-    best_y = y0
-
+    best_score, best_x, best_y = -1.0, 0, y0
     for y in range(y0, y1):
-        roi = bg_gray[y:y + ph, :].astype(np.float32)  # (ph, W)
-        windows = sliding_window_view(roi, (ph, pw))   # (W-pw+1, ph, pw)
-        weighted = windows * mask_f
-        means = weighted.sum(axis=(1, 2)) / mask_sum
-        centered = (windows - means[:, None, None]) * mask_f
-        stds = np.sqrt((centered ** 2).sum(axis=(1, 2)) / mask_sum) + 1e-6
-        ncc = (centered * chip_norm[None, :, :]).sum(axis=(1, 2)) / (stds * mask_sum)
+        roi = bg_gray[y:y + ph, :].astype(np.float32)
+        wins = sliding_window_view(roi, (ph, pw))
+        weighted = wins * mask_f
+        means = weighted.sum(axis=(1, 2)) / msum
+        centered = (wins - means[:, None, None]) * mask_f
+        stds = np.sqrt((centered ** 2).sum(axis=(1, 2)) / msum) + 1e-6
+        ncc = (centered * cnorm[None, :, :]).sum(axis=(1, 2)) / (stds * msum)
         idx = int(np.argmax(ncc))
         if ncc[idx] > best_score:
             best_score = float(ncc[idx])
             best_x = idx
             best_y = y
-    return best_x, best_y, best_score
+
+    print(f"   🧪 NCC: best=({best_x},{best_y}) score={best_score:.3f} (py={py})")
+    vmax = int(meta.get("vmax") or W)
+    return max(0, min(vmax, best_x))
 
 
-def _solve_puzzle(bg_bytes, piece_bytes, meta):
-    bg = _decode(bg_bytes)
-    chip = _decode(piece_bytes)
-    if bg is None or chip is None:
-        raise RuntimeError("解码失败")
-    if bg.ndim == 3:
-        bg_rgb = bg[:, :, :3]
-    else:
-        bg_rgb = cv2.cvtColor(bg, cv2.COLOR_GRAY2BGR)
-
-    if chip.ndim != 3 or chip.shape[2] != 4:
-        raise RuntimeError("chip 缺少 alpha")
-
-    bg_gray = cv2.cvtColor(bg_rgb, cv2.COLOR_BGR2GRAY).astype(np.uint8)
-    chip_gray = cv2.cvtColor(chip[:, :, :3], cv2.COLOR_BGR2GRAY).astype(np.uint8)
-    mask = (chip[:, :, 3] > 100).astype(np.uint8)
-
-    py = int(meta.get("py", 0))
-    ph = chip_gray.shape[0]
-    # 目标形状的 y 应与 chip 显示的 y 一致 → 在 py 附近搜索
-    y_range = (py - 20, py + ph + 20)
-
-    bx, by, score = _ncc_match(bg_gray, chip_gray, mask, y_range)
-    print(f"   🧪 NCC: best=({bx},{by}) score={score:.3f} (py={py})")
-
-    vmax = int(meta.get("vmax") or bg_gray.shape[1])
-    return max(0, min(vmax, bx))
-
-
-def _solve_rotate(bg_bytes, chip_bytes, meta):
+def _solve_rotate(bg_bytes, chip_bytes, meta, tag=""):
+    """
+    rotate：chip 固定在 (ox,oy,ow,oh)，绕中心旋转。
+    在固定位置扫描角度，用掩码 NCC 打分。
+    返回 CSS 顺时针度数 = (360 - 逆时针角) % 360。
+    """
     bg = _decode(bg_bytes)
     chip = _decode(chip_bytes)
     if bg is None or chip is None:
@@ -392,42 +402,125 @@ def _solve_rotate(bg_bytes, chip_bytes, meta):
     bg_rgb = bg[:, :, :3] if bg.ndim == 3 else cv2.cvtColor(bg, cv2.COLOR_GRAY2BGR)
     bg_gray = cv2.cvtColor(bg_rgb, cv2.COLOR_BGR2GRAY)
     H, W = bg_gray.shape
+
     ox, oy = int(meta["ox"]), int(meta["oy"])
     ow, oh = int(meta["ow"]), int(meta["oh"])
-    x0 = max(0, ox - 12); y0 = max(0, oy - 12)
-    x1 = min(W, ox + ow + 12); y1 = min(H, oy + oh + 12)
-    target = bg_gray[y0:y1, x0:x1]
 
-    piece_gray = cv2.cvtColor(chip[:, :, :3], cv2.COLOR_BGR2GRAY)
-    piece_mask = (chip[:, :, 3] > 100).astype(np.uint8)
-    ch, cw = piece_gray.shape
-    cx, cy = cw / 2.0, ch / 2.0
+    pad = 30
+    x0 = max(0, ox - pad)
+    y0 = max(0, oy - pad)
+    x1 = min(W, ox + ow + pad)
+    y1 = min(H, oy + oh + pad)
+    target = bg_gray[y0:y1, x0:x1]
+    th, tw = target.shape
+
+    if chip.ndim == 3 and chip.shape[2] == 4:
+        chip_rgb = chip[:, :, :3]
+        chip_alpha = chip[:, :, 3]
+    else:
+        chip_rgb = chip[:, :, :3] if chip.ndim == 3 else cv2.cvtColor(chip, cv2.COLOR_GRAY2BGR)
+        cg = cv2.cvtColor(chip_rgb, cv2.COLOR_BGR2GRAY)
+        _, chip_alpha = cv2.threshold(cg, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+
+    if chip_alpha.max() > 100:
+        ys, xs = np.where(chip_alpha > 100)
+        if len(xs) > 0:
+            cx0, cx1 = int(xs.min()), int(xs.max()) + 1
+            cy0, cy1 = int(ys.min()), int(ys.max()) + 1
+            chip_gray = cv2.cvtColor(chip_rgb[cy0:cy1, cx0:cx1], cv2.COLOR_BGR2GRAY)
+            chip_mask = chip_alpha[cy0:cy1, cx0:cx1]
+        else:
+            chip_gray = cv2.cvtColor(chip_rgb, cv2.COLOR_BGR2GRAY)
+            chip_mask = chip_alpha
+    else:
+        chip_gray = cv2.cvtColor(chip_rgb, cv2.COLOR_BGR2GRAY)
+        chip_mask = chip_alpha
+
+    ch, cw = chip_gray.shape
+    ccx, ccy = cw / 2.0, ch / 2.0
+
+    tgt_cx = (ox + ow / 2.0) - x0
+    tgt_cy = (oy + oh / 2.0) - y0
+
+    def _score_angle(angle):
+        M = cv2.getRotationMatrix2D((ccx, ccy), angle, 1.0)
+        cos_a, sin_a = abs(M[0, 0]), abs(M[0, 1])
+        nw = int(np.ceil(ch * sin_a + cw * cos_a))
+        nh = int(np.ceil(ch * cos_a + cw * sin_a))
+        M[0, 2] += nw / 2.0 - ccx
+        M[1, 2] += nh / 2.0 - ccy
+        rot = cv2.warpAffine(chip_gray, M, (nw, nh),
+                             flags=cv2.INTER_LINEAR, borderValue=0)
+        rot_m = cv2.warpAffine(chip_mask, M, (nw, nh),
+                               flags=cv2.INTER_NEAREST, borderValue=0)
+        px = int(round(tgt_cx - nw / 2.0))
+        py = int(round(tgt_cy - nh / 2.0))
+
+        tx0 = max(0, px); ty0 = max(0, py)
+        tx1 = min(tw, px + nw); ty1 = min(th, py + nh)
+        if tx1 <= tx0 or ty1 <= ty0:
+            return -1.0, rot, rot_m, px, py
+
+        rx0 = tx0 - px; ry0 = ty0 - py
+        rx1 = rx0 + (tx1 - tx0); ry1 = ry0 + (ty1 - ty0)
+        a = target[ty0:ty1, tx0:tx1].astype(np.float32)
+        b = rot[ry0:ry1, rx0:rx1].astype(np.float32)
+        m = rot_m[ry0:ry1, rx0:rx1] > 0
+        if m.sum() < 200:
+            return -1.0, rot, rot_m, px, py
+        av = a[m] - a[m].mean()
+        bv = b[m] - b[m].mean()
+        d = float(np.sqrt((av * av).sum()) * np.sqrt((bv * bv).sum()))
+        if d < 1e-6:
+            return -1.0, rot, rot_m, px, py
+        return float((av * bv).sum() / d), rot, rot_m, px, py
 
     best_angle, best_score = 0, -1.0
-    for angle in range(0, 360, 5):
-        M = cv2.getRotationMatrix2D((cx, cy), angle, 1.0)
-        cos = abs(M[0, 0]); sin = abs(M[0, 1])
-        nw = int(ch * sin + cw * cos); nh = int(ch * cos + cw * sin)
-        M[0, 2] += nw / 2.0 - cx; M[1, 2] += nh / 2.0 - cy
-        rot = cv2.warpAffine(piece_gray, M, (nw, nh),
-                             flags=cv2.INTER_LINEAR, borderValue=0)
-        rot_mask = cv2.warpAffine(piece_mask, M, (nw, nh),
-                                  flags=cv2.INTER_NEAREST, borderValue=0)
-        if rot.shape[0] > target.shape[0] or rot.shape[1] > target.shape[1]:
-            continue
-        try:
-            res = cv2.matchTemplate(target, rot, cv2.TM_CCORR_NORMED, mask=rot_mask)
-            _, mv, _, _ = cv2.minMaxLoc(res)
-            if mv > best_score:
-                best_score, best_angle = mv, angle
-        except Exception:
-            continue
-    submit_value = (360 - best_angle) % 360
-    print(f"   🎯 rotate: best_angle={best_angle} score={best_score:.3f} → {submit_value}")
-    return submit_value
+    best_rot = best_rot_m = None
+    best_px = best_py = 0
+
+    # 粗扫 3°
+    for angle in range(0, 360, 3):
+        s, rot, rot_m, px, py = _score_angle(angle)
+        if s > best_score:
+            best_score, best_angle = s, angle
+            best_rot, best_rot_m = rot, rot_m
+            best_px, best_py = px, py
+
+    # 精扫 ±2°
+    for da in (-2, -1, 1, 2):
+        angle = (best_angle + da) % 360
+        s, rot, rot_m, px, py = _score_angle(angle)
+        if s > best_score:
+            best_score, best_angle = s, angle
+            best_rot, best_rot_m = rot, rot_m
+            best_px, best_py = px, py
+
+    print(f"   🎯 rotate: 逆时针={best_angle}° ncc={best_score:.3f}")
+
+    # 保存可视化
+    try:
+        if best_rot is not None:
+            vis = cv2.cvtColor(target, cv2.COLOR_GRAY2BGR)
+            h2, w2 = best_rot.shape
+            tx0, ty0 = max(0, best_px), max(0, best_py)
+            tx1, ty1 = min(tw, best_px + w2), min(th, best_py + h2)
+            rx0, ry0 = tx0 - best_px, ty0 - best_py
+            rx1 = rx0 + (tx1 - tx0); ry1 = ry0 + (ty1 - ty0)
+            m3 = (best_rot_m[ry0:ry1, rx0:rx1] > 0)
+            sub = vis[ty0:ty1, tx0:tx1]
+            sub[m3] = (sub[m3] * 0.5 +
+                       np.array([0, 0, 255]) * 0.5).astype(np.uint8)
+            cv2.imwrite(os.path.join(SCREENSHOT_DIR,
+                                     f"rotate_vis_{tag}.png"), vis)
+    except Exception as e:
+        print(f"   ⚠️ 可视化: {e}")
+
+    return (360 - best_angle) % 360
 
 
 def _solve_odd(bg_bytes, meta):
+    """odd：找颜色/纹理最不合群的那个 item，返回其索引。"""
     bg = _decode(bg_bytes)
     if bg is None:
         return None
@@ -435,6 +528,7 @@ def _solve_odd(bg_bytes, meta):
     items = meta.get("items") or []
     if len(items) < 3:
         return None
+
     feats = []
     for it in items:
         x, y, r = int(it["x"]), int(it["y"]), int(it["r"])
@@ -442,18 +536,23 @@ def _solve_odd(bg_bytes, meta):
         x2, y2 = min(bg_rgb.shape[1], x + r), min(bg_rgb.shape[0], y + r)
         patch = bg_rgb[y1:y2, x1:x2]
         if patch.size == 0:
-            feats.append(None); continue
+            feats.append(None)
+            continue
         hsv = cv2.cvtColor(patch, cv2.COLOR_BGR2HSV)
         h = cv2.calcHist([hsv], [0, 1], None, [30, 32], [0, 180, 0, 256])
         h = cv2.normalize(h, h).flatten().astype(np.float32)
         feats.append(h)
+
     best_i, best_score = -1, -1.0
     for i, fi in enumerate(feats):
-        if fi is None: continue
+        if fi is None:
+            continue
         tot, cnt = 0.0, 0
         for j, fj in enumerate(feats):
-            if i == j or fj is None: continue
-            tot += float(cv2.compareHist(fi, fj, cv2.HISTCMP_BHATTACHARYYA)); cnt += 1
+            if i == j or fj is None:
+                continue
+            tot += float(cv2.compareHist(fi, fj, cv2.HISTCMP_BHATTACHARYYA))
+            cnt += 1
         if cnt and tot / cnt > best_score:
             best_score, best_i = tot / cnt, i
     return best_i if best_i >= 0 else None
@@ -467,7 +566,8 @@ def _click_box_at(page, meta, ix, iy):
         raise RuntimeError("captcha box 不可见")
     sx = box["width"] / float(meta.get("w", 300))
     sy = box["height"] / float(meta.get("h", 160))
-    px = box["x"] + ix * sx; py = box["y"] + iy * sy
+    px = box["x"] + ix * sx
+    py = box["y"] + iy * sy
     page.mouse.move(px, py)
     page.wait_for_timeout(random.randint(80, 160))
     page.mouse.click(px, py)
@@ -475,7 +575,11 @@ def _click_box_at(page, meta, ix, iy):
 
 def _drag_slider(page, value, vmax):
     """
-    ★ 修正映射：HTML 里 handle.style.left = (3 + 94*frac)%，left 是 handle 中心。
+    与组件 trackToValue 对齐：
+      frac = (clientX - track.left - hw/2) / (track.width - hw)
+      value = frac * vmax
+    反解：
+      clientX = track.left + hw/2 + (value/vmax) * (track.width - hw)
     """
     track = page.locator("#captcha_track_default")
     track.wait_for(state="visible", timeout=5000)
@@ -483,9 +587,15 @@ def _drag_slider(page, value, vmax):
     if not box:
         raise RuntimeError("track 不可见")
 
+    hw = page.evaluate("""() => {
+        const h = document.getElementById('captcha_handle_default');
+        return h ? h.offsetWidth : 24;
+    }""") or 24
+
     frac = max(0.0, min(1.0, value / max(1, vmax)))
-    target_x = box["x"] + box["width"] * (0.03 + 0.94 * frac)
-    start_x = box["x"] + box["width"] * 0.03
+    usable = max(1.0, box["width"] - hw)
+    target_x = box["x"] + hw / 2 + frac * usable
+    start_x = box["x"] + hw / 2
     y = box["y"] + box["height"] / 2
 
     page.mouse.move(start_x, y)
@@ -498,10 +608,10 @@ def _drag_slider(page, value, vmax):
         t = i / steps
         eased = 1 - (1 - t) ** 2
         x = start_x + (target_x - start_x) * eased
-        page.mouse.move(x, y + random.uniform(-1.8, 1.8))
+        page.mouse.move(x, y + random.uniform(-1.5, 1.5))
         page.wait_for_timeout(random.randint(10, 25))
 
-    over = random.uniform(3, 8)
+    over = random.uniform(3, 6)
     page.mouse.move(target_x + over, y + random.uniform(-2, 2))
     page.wait_for_timeout(random.randint(50, 90))
     page.mouse.move(target_x - random.uniform(1, 3), y + random.uniform(-1, 1))
@@ -511,39 +621,64 @@ def _drag_slider(page, value, vmax):
     page.mouse.up()
 
 
-def _handle_one_stage(page, meta, frames):
+# ================= 一关处理 =================
+
+def _handle_one_stage(page, meta, frames, tag=""):
+    """
+    返回：
+      True      -> 已提交，等主循环处理响应
+      "switched"-> 已切换类型，主循环重新取 meta
+      False     -> 无法处理
+    """
     kind = meta.get("kind")
-    print(f"   🎯 kind={kind} nf={meta.get('nf')} py={meta.get('py')} "
-          f"stage={meta.get('stage')}/{meta.get('stages')}")
+    alt = meta.get("alt")
+    print(f"   🎯 kind={kind} nf={meta.get('nf')} "
+          f"stage={meta.get('stage')}/{meta.get('stages')} alt={alt}")
+
+    # 难题自动切换
+    if kind not in PREFERRED_KINDS and alt in PREFERRED_KINDS:
+        try:
+            btn = page.locator("#captcha_switch_default").first
+            if btn.is_visible(timeout=1500):
+                btn.click()
+                print(f"   🔁 切换到更擅长的类型: {alt}")
+                return "switched"
+        except Exception as e:
+            print(f"   ⚠️ 切换失败: {e}")
 
     if kind in ("puzzle", "key"):
         if len(frames) < 2:
-            print("   ⚠️ nf<2"); return False
+            print("   ⚠️ nf<2")
+            return False
         try:
             value = _solve_puzzle(frames[0], frames[1], meta)
             print(f"   🧩 value={value} vmax={meta.get('vmax')}")
             _drag_slider(page, value, int(meta.get("vmax") or 300))
             return True
         except Exception as e:
-            print(f"   ❌ puzzle: {e}"); return False
+            print(f"   ❌ puzzle: {e}")
+            return False
 
     if kind == "rotate":
         if len(frames) < 2:
-            print("   ⚠️ nf<2"); return False
+            print("   ⚠️ nf<2")
+            return False
         try:
-            value = _solve_rotate(frames[0], frames[1], meta)
-            print(f"   🎯 value={value}")
+            value = _solve_rotate(frames[0], frames[1], meta, tag=tag)
+            print(f"   🎯 value={value} vmax={meta.get('vmax')}")
             _drag_slider(page, value, int(meta.get("vmax") or 359))
             return True
         except Exception as e:
-            print(f"   ❌ rotate: {e}"); return False
+            print(f"   ❌ rotate: {e}")
+            return False
 
     if kind == "odd":
         if not frames:
             return False
         idx = _solve_odd(frames[0], meta)
         if idx is None:
-            print("   ⚠️ odd 求解失败"); return False
+            print("   ⚠️ odd 求解失败")
+            return False
         items = meta.get("items") or []
         it = items[idx]
         print(f"   🎯 点击 item[{idx}] @({it['x']},{it['y']})")
@@ -551,7 +686,8 @@ def _handle_one_stage(page, meta, frames):
             _click_box_at(page, meta, it["x"], it["y"])
             return True
         except Exception as e:
-            print(f"   ❌ odd: {e}"); return False
+            print(f"   ❌ odd: {e}")
+            return False
 
     print(f"   ⚠️ 未支持 kind: {kind}")
     return False
@@ -560,11 +696,6 @@ def _handle_one_stage(page, meta, frames):
 # ================= 多 stage 会话 =================
 
 def _try_renew_session(page, attempt, initial_days):
-    """
-    ★ 关键修复：
-      - 同 id 不同 py 的挑战视为新挑战（用 (id,py,px,ox,oy) 指纹）
-      - 每关处理完不等待特定响应，让主循环自然检查 meta / last_resp
-    """
     print(f"\n   {'='*40}\n   🔄 第 {attempt} 次会话\n   {'='*40}")
 
     try:
@@ -576,11 +707,12 @@ def _try_renew_session(page, attempt, initial_days):
         print(f"   ❌ 未找到续期按钮: {e}")
         return None
 
-    # 等 captcha 就绪（页面加载时已收到，或弹窗触发后到达）
+    # 等 captcha 数据可用
     ok = False
     for _ in range(80):
         if WS_STATE["meta"] and WS_STATE["meta"].get("id"):
-            ok = True; break
+            ok = True
+            break
         page.wait_for_timeout(200)
     if not ok:
         print(f"   ❌ 无 meta，last_resp={WS_STATE['last_resp']!r}")
@@ -588,14 +720,15 @@ def _try_renew_session(page, attempt, initial_days):
         return None
 
     handled_fps = set()
+    switch_count = 0
     last_action = time.time()
     start = time.time()
-    max_total = 220
+    max_total = 260
 
     while time.time() - start < max_total:
         resp = WS_STATE["last_resp"]
 
-        # ---------- 终点 ----------
+        # ---- 终点 ----
         if resp and resp.startswith("ok:"):
             token = resp[3:]
             print(f"   🎉 全部通过！token 长度={len(token)}")
@@ -632,17 +765,18 @@ def _try_renew_session(page, attempt, initial_days):
             return None
 
         if resp in ("burned", "blocked", "rate"):
-            print(f"   ❌ 服务端拒绝: {resp}"); return None
+            print(f"   ❌ 服务端拒绝: {resp}")
+            return None
         if resp and resp.startswith("bot:"):
-            print(f"   ❌ bot: {resp}"); return None
+            print(f"   ❌ bot: {resp}")
+            return None
 
-        # ---------- 拿 meta ----------
+        # ---- 拿 meta ----
         meta = WS_STATE["meta"]
         if not meta or not meta.get("id"):
             page.wait_for_timeout(300)
             continue
 
-        # ---------- 指纹去重（同 id 不同 py 也视为新挑战） ----------
         fp = (meta["id"], meta.get("py"), meta.get("px"),
               meta.get("ox"), meta.get("oy"))
         if fp in handled_fps:
@@ -661,23 +795,30 @@ def _try_renew_session(page, attempt, initial_days):
         handled_fps.add(fp)
         last_action = time.time()
 
-        # 保存帧
+        tag = f"a{attempt}_{meta['id'][:6]}"
         for i, fb in enumerate(frames):
             try:
-                tag = meta["id"][:6]
-                py = meta.get("py", 0)
                 with open(os.path.join(
                     SCREENSHOT_DIR,
-                    f"captcha_a{attempt}_{tag}_py{py}_f{i}.png"), "wb") as f:
+                    f"captcha_{tag}_{meta.get('kind')}_f{i}.png"), "wb") as f:
                     f.write(fb)
             except Exception:
                 pass
 
-        ok = _handle_one_stage(page, meta, frames)
-        if not ok:
+        result = _handle_one_stage(page, meta, frames, tag=tag)
+
+        if result == "switched":
+            switch_count += 1
+            if switch_count > MAX_SWITCH_PER_SESSION:
+                print("   ⚠️ 切换次数过多，退出")
+                return None
+            # 等新 meta
+            page.wait_for_timeout(800)
+            continue
+
+        if not result:
             return None
 
-        # 等一会让服务端响应，然后由循环自然进入下一关
         page.wait_for_timeout(600)
 
     print(f"   ❌ 超时 {max_total}s")
@@ -691,7 +832,8 @@ def try_renew_captcha(page, initial_days, max_attempts=4):
             r = _try_renew_session(page, attempt, initial_days)
         except Exception as e:
             print(f"   ❌ 第 {attempt} 次会话异常: {e}")
-            import traceback; traceback.print_exc()
+            import traceback
+            traceback.print_exc()
             r = None
 
         if r is True:
@@ -756,7 +898,7 @@ def get_vps_urls(page):
 
 def main():
     print("#" * 50)
-    print("   Openworld VPS 自动续期 (v8 - 指纹去重 + NCC)")
+    print("   Openworld VPS 自动续期 (v10)")
     print("#" * 50)
 
     if not DISCORD_TOKEN:
@@ -771,7 +913,8 @@ def main():
             headless=headless,
             args=[
                 "--disable-blink-features=AutomationControlled",
-                "--no-sandbox", "--disable-dev-shm-usage",
+                "--no-sandbox",
+                "--disable-dev-shm-usage",
                 "--disable-features=IsolateOrigins,site-per-process",
             ]
         )
@@ -780,7 +923,8 @@ def main():
                         "AppleWebKit/537.36 (KHTML, like Gecko) "
                         "Chrome/130.0.0.0 Safari/537.36"),
             viewport={"width": 1280, "height": 720},
-            locale="en-US", timezone_id="America/New_York",
+            locale="en-US",
+            timezone_id="America/New_York",
         )
         ctx.add_init_script(STEALTH_JS)
         page = ctx.new_page()
@@ -820,7 +964,8 @@ def main():
                     text = ""
 
                 if "404" in page.title() or "Page Not Found" in page.title():
-                    print(f"❌ 404"); continue
+                    print("❌ 404")
+                    continue
 
                 print("✅ 到达 VPS 页面")
                 save_screenshot(page, f"vps_page_loaded_{idx}")
@@ -843,7 +988,8 @@ def main():
                 ok = try_renew_captcha(page, initial_days=days)
 
                 if ok:
-                    expiry = datetime.now(timezone(timedelta(hours=8))) + timedelta(days=6)
+                    expiry = datetime.now(timezone(timedelta(hours=8))) + \
+                             timedelta(days=6)
                     es = expiry.strftime("%Y-%m-%d %H:%M:%S") + " (GMT+8)"
                     print(f"✅ 续期成功，至: {es}")
                     send_telegram_message(
@@ -854,9 +1000,12 @@ def main():
 
         except Exception as e:
             print(f"\n💥 异常: {e}")
-            import traceback; traceback.print_exc()
-            try: save_screenshot(page, "uncaught_error")
-            except Exception: pass
+            import traceback
+            traceback.print_exc()
+            try:
+                save_screenshot(page, "uncaught_error")
+            except Exception:
+                pass
             send_telegram_message(f"❌ 异常: {str(e)[:200]}")
 
         finally:
