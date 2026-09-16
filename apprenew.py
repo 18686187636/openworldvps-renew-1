@@ -375,7 +375,11 @@ def _bg_black_shapes(bg_gray):
 def _solve_puzzle(bg_bytes, chip_bytes, meta):
     """
     puzzle/key：bg 上 3 个黑色形状，chip 是其中一个形状的彩色版本，
-    要拖到同形状的黑块上，让 chip 图片居中在形状中心。
+    要拖到同形状的黑块上，让 chip 图片"中心"与形状"中心"对齐。
+
+    ⭐ FIX: 拼图块在画布上的真实左边缘 = px + value，
+             所以滑块发送值应为 shape_cx - pw/2 - px。
+             原脚本漏掉 -px，导致 4px 系统性偏移，score 53/44/36 全 fail。
     """
     bg = _decode(bg_bytes)
     chip = _decode(chip_bytes)
@@ -427,18 +431,23 @@ def _solve_puzzle(bg_bytes, chip_bytes, meta):
     # 让 chip 图片的"中心"对齐形状的"中心"
     shape_cx = x + w / 2.0
     pw = int(meta.get("pw") or chip_w)
-    value = int(round(shape_cx - pw / 2.0))
+    px = int(meta.get("px") or 0)
+
+    # ⭐ FIX: 减去 px 偏移（拼图块在画布内的基准位置）
+    value = int(round(shape_cx - pw / 2.0 - px))
+
     vmax = int(meta.get("vmax") or 300)
     value = max(0, min(vmax, value))
 
     print(f"   🎯 选中 bbox=({x},{y},{w},{h}) score={best_score:.2f} "
-          f"→ shape_cx={shape_cx:.1f} pw={pw} value={value}")
+          f"shape_cx={shape_cx:.1f} pw={pw} px={px} → value={value}")
 
     # 调试可视化
     try:
         vis = bg_rgb.copy()
         cv2.rectangle(vis, (x, y), (x + w, y + h), (0, 0, 255), 2)
-        cv2.rectangle(vis, (value, y), (value + pw, y + h), (0, 255, 0), 2)
+        # 拼图块最终位置 = px + value
+        cv2.rectangle(vis, (px + value, y), (px + value + pw, y + h), (0, 255, 0), 2)
         cv2.imwrite(os.path.join(SCREENSHOT_DIR,
                                  f"puzzle_align_{meta['id'][:6]}.png"), vis)
     except Exception as e:
@@ -664,24 +673,30 @@ def _drag_slider(page, value, vmax):
 
 def _handle_one_stage(page, meta, frames, tag=""):
     """
-    True      -> 已提交
-    "switched"-> 已切换类型
-    False     -> 无法处理
+    True       -> 已提交
+    "switched" -> 已切换类型
+    False      -> 无法处理
     """
     kind = meta.get("kind")
     alt = meta.get("alt")
     print(f"   🎯 kind={kind} nf={meta.get('nf')} "
           f"stage={meta.get('stage')}/{meta.get('stages')} alt={alt}")
 
-    if kind not in PREFERRED_KINDS and alt in PREFERRED_KINDS:
-        try:
-            btn = page.locator("#captcha_switch_default").first
-            if btn.is_visible(timeout=1500):
-                btn.click()
-                print(f"   🔁 切换到更擅长的类型: {alt}")
-                return "switched"
-        except Exception as e:
-            print(f"   ⚠️ 切换失败: {e}")
+    # ⭐ FIX: 优先切掉不擅长的类型（包含 match）
+    if kind not in PREFERRED_KINDS:
+        if alt in PREFERRED_KINDS:
+            try:
+                btn = page.locator("#captcha_switch_default").first
+                if btn.is_visible(timeout=1500):
+                    btn.click()
+                    print(f"   🔁 切换到更擅长的类型: {kind} → {alt}")
+                    return "switched"
+            except Exception as e:
+                print(f"   ⚠️ 切换失败: {e}")
+        # match 等无 alt 可切时，直接放弃本次会话
+        if kind == "match":
+            print("   ⚠️ match 类型无法处理且无可用 alt，放弃会话")
+            return False
 
     if kind in ("puzzle", "key"):
         if len(frames) < 2:
@@ -764,6 +779,7 @@ def _try_renew_session(page, attempt, initial_days):
     while time.time() - start < max_total:
         resp = WS_STATE["last_resp"]
 
+        # ---- 成功 ----
         if resp and resp.startswith("ok:"):
             token = resp[3:]
             print(f"   🎉 全部通过！token 长度={len(token)}")
@@ -799,12 +815,23 @@ def _try_renew_session(page, attempt, initial_days):
             print("   ⚠️ 无法解析天数")
             return None
 
+        # ---- 服务端拒绝 ----
         if resp in ("burned", "blocked", "rate"):
             print(f"   ❌ 服务端拒绝: {resp}")
             return None
         if resp and resp.startswith("bot:"):
             print(f"   ❌ bot: {resp}")
             return None
+
+        # ⭐ FIX: 处理 fail / failed: 响应（原脚本未处理，导致去重后空转 45s 退出）
+        if resp and (resp == "fail" or resp.startswith("failed:")):
+            print("   ⚠️ 服务端拒绝了本次答案，重置状态等待新验证码")
+            handled_fps.clear()                # 关键：清掉重复指纹
+            WS_STATE["meta"]      = None
+            WS_STATE["last_resp"] = None
+            WS_STATE["frames"]    = []
+            page.wait_for_timeout(350)
+            continue
 
         meta = WS_STATE["meta"]
         if not meta or not meta.get("id"):
@@ -815,8 +842,9 @@ def _try_renew_session(page, attempt, initial_days):
               meta.get("ox"), meta.get("oy"))
         if fp in handled_fps:
             page.wait_for_timeout(300)
-            if time.time() - last_action > 45:
-                print("   ⚠️ 45s 无新状态，退出")
+            # ⭐ FIX: 45s → 60s，避免偶发延迟误杀
+            if time.time() - last_action > 60:
+                print("   ⚠️ 60s 无新状态，退出")
                 return None
             continue
 
@@ -931,7 +959,7 @@ def get_vps_urls(page):
 
 def main():
     print("#" * 50)
-    print("   Openworld VPS 自动续期 (v13 - 居中匹配)")
+    print("   Openworld VPS 自动续期 (v14 - px 偏移修正 + fail 恢复)")
     print("#" * 50)
 
     if not DISCORD_TOKEN:
