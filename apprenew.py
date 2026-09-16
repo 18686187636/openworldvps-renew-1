@@ -5,7 +5,6 @@ import os
 import re
 import sys
 import json
-import io
 import base64
 import random
 import urllib.parse
@@ -201,63 +200,154 @@ def login_with_discord_token(page, dc_token: str) -> bool:
     except Exception as e:
         print(f"   ⚠️ 登录页异常: {e}")
 
-    current_url = page.url
-    print(f"\n📌 第3步：检查是否到达 Discord OAuth")
+    print(f"\n📌 第3步：定位登录入口（Clerk / Discord）")
 
-    if "discord.com" not in current_url:
-        print("   未自动跳转，尝试点击登录按钮...")
-        btn_selectors = [
-            "button:has-text('Sign in with Discord')",
-            "a:has-text('Sign in with Discord')",
-            "button:has-text('Discord')",
-            "a:has-text('Discord')",
-            "button:has-text('登录')",
-            "a:has-text('登录')",
-        ]
-        for selector in btn_selectors:
+    def _click_first_visible(selectors, timeout_each=3000, desc=""):
+        """按顺序尝试每个 selector，点中第一个可见元素并返回 True。"""
+        for sel in selectors:
             try:
-                btn = page.locator(selector).first
-                if btn.is_visible(timeout=3000):
-                    print(f"   点击: '{btn.inner_text().strip()}'")
-                    btn.click()
-                    time.sleep(5)
-                    if "discord.com" in page.url:
-                        break
+                el = page.locator(sel).first
+                if el.is_visible(timeout=timeout_each):
+                    txt = ""
+                    try:
+                        txt = (el.inner_text() or "").strip()[:30]
+                    except Exception:
+                        pass
+                    print(f"   🔘 命中 {desc} 选择器: {sel} (文本='{txt}')")
+                    el.click()
+                    return True
             except Exception:
                 continue
+        return False
 
+    current_url = page.url
+
+    # --- 3a. 若已经在 Discord OAuth 上，直接跳过 ---
+    if "discord.com" in current_url:
+        print(f"   已在 Discord 域，跳过入口点击")
+    else:
+        # --- 3b. 优先点 Clerk 入口 ---
+        clerk_selectors = [
+            "#clerk-signin",
+            "button[id='clerk-signin']",
+            "button:has-text('Sign in with Clerk')",
+            "[data-clerk-component] button",
+        ]
+        clicked = _click_first_visible(clerk_selectors, desc="Clerk 入口")
+
+        if clicked:
+            print("   ⏳ 等待 Clerk 界面加载...")
+            time.sleep(4)
+
+            discord_in_clerk = [
+                "button:has-text('Continue with Discord')",
+                "button.cl-socialButtonsBlockButton",
+                "button[data-localization-key='socialButtonsBlockButton']",
+                "button:has-text('Discord')",
+                "a:has-text('Continue with Discord')",
+                "a:has-text('Discord')",
+            ]
+
+            # 主文档里点
+            _click_first_visible(discord_in_clerk, desc="Clerk 内 Discord")
+
+            # iframe 兜底
+            if "discord.com" not in page.url:
+                try:
+                    for fr in page.frames:
+                        furl = (fr.url or "").lower()
+                        if "clerk" in furl or "accounts" in furl:
+                            for sel in discord_in_clerk:
+                                try:
+                                    el = fr.locator(sel).first
+                                    if el.is_visible(timeout=1500):
+                                        print(f"   🔘 命中 Clerk iframe: {sel}")
+                                        el.click()
+                                        break
+                                except Exception:
+                                    continue
+                except Exception:
+                    pass
+
+            # 等待真正跳到 Discord
+            try:
+                page.wait_for_url(
+                    re.compile(r"discord\.com"),
+                    timeout=20000,
+                    wait_until="domcontentloaded",
+                )
+                print("   ✅ Clerk 已跳到 Discord")
+            except Exception:
+                print("   ⚠️ 点击后未自动跳转，继续兜底流程")
+
+        # --- 3c. 兜底：直接找页面上的 Discord 按钮 ---
+        if "discord.com" not in page.url and not clicked:
+            fallback = [
+                "button:has-text('Sign in with Discord')",
+                "a:has-text('Sign in with Discord')",
+                "button:has-text('Continue with Discord')",
+                "button:has-text('Discord')",
+                "a:has-text('Discord')",
+                "button:has-text('登录')",
+                "a:has-text('登录')",
+            ]
+            _click_first_visible(fallback, desc="通用 Discord 入口")
+
+        # --- 3d. 兜底：从源码提取 OAuth URL ---
         if "discord.com" not in page.url:
-            print("   尝试从源码提取 OAuth 链接...")
+            print("   尝试从页面源码提取 OAuth 链接...")
             try:
                 html = page.content()
                 m = re.search(r'https://discord\.com/oauth2/authorize[^\s"\'<>]+', html)
                 if m:
+                    print(f"   找到 OAuth 链接: {m.group(0)[:80]}...")
                     page.goto(m.group(0), wait_until="domcontentloaded", timeout=30000)
                     time.sleep(3)
             except Exception as e:
-                print(f"   ⚠️ {e}")
+                print(f"   ⚠️ 源码提取失败: {e}")
 
+    # --- 3e. 等待最终跳到 Discord ---
     if "discord.com" not in page.url:
-        for _ in range(10):
+        print("   等待可能的延迟跳转...")
+        for _ in range(15):
             time.sleep(1)
+            if "discord.com" in page.url:
+                break
+            # 如果 Clerk 弹窗还在，再点一次
+            try:
+                for sel in ["button:has-text('Continue with Discord')",
+                            "button.cl-socialButtonsBlockButton",
+                            "button:has-text('Discord')"]:
+                    el = page.locator(sel).first
+                    if el.is_visible(timeout=500):
+                        el.click()
+                        time.sleep(2)
+                        break
+            except Exception:
+                pass
             if "discord.com" in page.url:
                 break
 
     if "discord.com" not in page.url:
-        print(f"   ❌ 未跳转到 Discord，URL: {page.url}")
+        print(f"   ❌ 无法跳转到 Discord")
+        print(f"   当前 URL: {page.url}")
+        print(f"   页面标题: {page.title()}")
         save_screenshot(page, "login_failed_no_discord")
         return False
 
-    print(f"   ✅ 已到 Discord OAuth")
+    print(f"   ✅ 已到达 Discord OAuth 页面")
 
     print(f"\n📌 第4步：解析 OAuth 参数")
     oauth_url = page.url
+    print(f"   Discord URL: {oauth_url[:120]}...")
+
     if "discord.com/login" in oauth_url and "redirect_to=" in oauth_url:
         parsed_login = urllib.parse.urlparse(oauth_url)
         login_params = urllib.parse.parse_qs(parsed_login.query)
         redirect_to = login_params.get("redirect_to", [""])[0]
         if redirect_to:
             oauth_url = ("https://discord.com" + redirect_to) if redirect_to.startswith("/") else redirect_to
+            print(f"   解码出 OAuth URL: {oauth_url[:120]}...")
 
     parsed = urllib.parse.urlparse(oauth_url)
     params = urllib.parse.parse_qs(parsed.query)
@@ -272,9 +362,10 @@ def login_with_discord_token(page, dc_token: str) -> bool:
     print(f"   Client ID:    {client_id}")
     print(f"   Redirect URI: {redirect_uri}")
     print(f"   Scope:        {scope}")
+    print(f"   State:        {state[:20]}..." if state else "   State:        (空)")
 
     if not client_id or not redirect_uri:
-        print("   ❌ 无法解析 OAuth 参数")
+        print("   ❌ 无法解析关键 OAuth 参数")
         save_screenshot(page, "login_failed_parse")
         return False
 
@@ -339,6 +430,8 @@ def login_with_discord_token(page, dc_token: str) -> bool:
     wait_for_cloudflare(page)
 
     final_url = page.url
+    print(f"   回调后 URL: {final_url}")
+
     if "/login" in final_url and "discord" not in final_url:
         time.sleep(5)
         final_url = page.url
@@ -668,7 +761,6 @@ def get_vps_urls(page) -> list:
                 full_url = urllib.parse.urljoin(SITE_BASE, href)
                 path = urllib.parse.urlparse(full_url).path.rstrip('/')
                 parts = [p for p in path.split('/') if p]
-                # 只保留 /vps/<uuid> 这种形态，排除 /vps、/vps/list、/vps/new 等
                 if len(parts) == 2 and parts[0] == "vps" and \
                    parts[1] not in ("list", "new", "create"):
                     if full_url not in found:
@@ -717,7 +809,7 @@ def get_vps_urls(page) -> list:
 
 def main():
     print("#" * 50)
-    print("   Openworld VPS 自动续期脚本 (v2 - WebSocket 拼图版)")
+    print("   Openworld VPS 自动续期脚本 (v3 - Clerk + 拼图)")
     print("#" * 50)
 
     if not DISCORD_TOKEN:
