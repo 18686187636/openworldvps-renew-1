@@ -30,7 +30,6 @@ SITE_BASE     = "https://openworld.eu.org"
 RENEW_THRESHOLD_DAYS = 5
 SCREENSHOT_DIR = os.environ.get("SCREENSHOT_DIR", ".")
 
-# puzzle / key 会优先；其他类型如果 alt 在偏好列表里也会切换过去
 PREFERRED_KINDS = ("puzzle", "key", "odd")
 MAX_SWITCH_PER_SESSION = 6
 # ==========================================
@@ -321,7 +320,7 @@ def _decode(b):
 
 
 def _chip_shape(chip):
-    """从 chip 的 alpha 提取形状描述。返回 (w, h, circularity, n_vert, alpha_crop)。"""
+    """从 chip 的 alpha 提取形状描述。"""
     alpha = chip[:, :, 3]
     ys, xs = np.where(alpha > 200)
     if len(xs) == 0:
@@ -347,7 +346,7 @@ def _chip_shape(chip):
 
 
 def _bg_black_shapes(bg_gray):
-    """找 bg 上所有黑色连通域，返回候选列表。"""
+    """找 bg 上所有黑色连通域。"""
     _, th = cv2.threshold(bg_gray, 40, 255, cv2.THRESH_BINARY_INV)
     kernel = np.ones((3, 3), np.uint8)
     th = cv2.morphologyEx(th, cv2.MORPH_CLOSE, kernel, iterations=1)
@@ -375,9 +374,8 @@ def _bg_black_shapes(bg_gray):
 
 def _solve_puzzle(bg_bytes, chip_bytes, meta):
     """
-    puzzle/key：bg 上有 3 个黑色形状（三角/方/圆），
-    chip 是其中一个形状的彩色版本，要拖到同形状的黑块上。
-    匹配：形状相似度 60% + 尺寸相似度 40%。
+    puzzle/key：bg 上 3 个黑色形状，chip 是其中一个形状的彩色版本，
+    要拖到同形状的黑块上，让 chip 图片居中在形状中心。
     """
     bg = _decode(bg_bytes)
     chip = _decode(chip_bytes)
@@ -426,10 +424,27 @@ def _solve_puzzle(bg_bytes, chip_bytes, meta):
         raise RuntimeError(f"无匹配形状 (best_score={best_score:.2f})")
 
     x, y, w, h = best["bbox"]
-    print(f"   🎯 选中 bbox=({x},{y},{w},{h}) score={best_score:.2f}")
-
+    # 让 chip 图片的"中心"对齐形状的"中心"
+    shape_cx = x + w / 2.0
+    pw = int(meta.get("pw") or chip_w)
+    value = int(round(shape_cx - pw / 2.0))
     vmax = int(meta.get("vmax") or 300)
-    return max(0, min(vmax, x))
+    value = max(0, min(vmax, value))
+
+    print(f"   🎯 选中 bbox=({x},{y},{w},{h}) score={best_score:.2f} "
+          f"→ shape_cx={shape_cx:.1f} pw={pw} value={value}")
+
+    # 调试可视化
+    try:
+        vis = bg_rgb.copy()
+        cv2.rectangle(vis, (x, y), (x + w, y + h), (0, 0, 255), 2)
+        cv2.rectangle(vis, (value, y), (value + pw, y + h), (0, 255, 0), 2)
+        cv2.imwrite(os.path.join(SCREENSHOT_DIR,
+                                 f"puzzle_align_{meta['id'][:6]}.png"), vis)
+    except Exception as e:
+        print(f"   ⚠️ 可视化: {e}")
+
+    return value
 
 
 def _solve_rotate(bg_bytes, chip_bytes, meta, tag=""):
@@ -916,7 +931,7 @@ def get_vps_urls(page):
 
 def main():
     print("#" * 50)
-    print("   Openworld VPS 自动续期 (v12 - 形状匹配)")
+    print("   Openworld VPS 自动续期 (v13 - 居中匹配)")
     print("#" * 50)
 
     if not DISCORD_TOKEN:
