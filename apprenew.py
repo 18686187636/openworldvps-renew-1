@@ -70,22 +70,43 @@ STEALTH_JS = r"""
 
   // ---- Hook WebSocket ----
   var OrigWS = window.WebSocket;
-  window.__ow = { meta: null, frames: [], lastResp: null, sent: [],
-                  closed: false, closeCode: null };
+  // __ow 是一个持久化的收集器，不随新的挑战重置
+  window.__ow = {
+    meta: null,
+    metaId: null,
+    frames: [],
+    lastResp: null,
+    sent: [],
+    closed: false,
+    closeCode: null,
+    ws_refs: []
+  };
 
   function OWWS(url, protocols) {
     var ws = (protocols === undefined) ? new OrigWS(url) : new OrigWS(url, protocols);
+    try { window.__ow.ws_refs.push(ws); } catch(e) {}
+    try { window.__ow.closed = false; window.__ow.closeCode = null; } catch(e) {}
+
     ws.addEventListener('message', function(ev) {
       if (typeof ev.data === 'string') {
         window.__ow.lastResp = ev.data;
         try {
           var m = JSON.parse(ev.data);
           if (m && m.id && m.nf) {
-            window.__ow.meta = m;
-            window.__ow.frames = [];
+            // 关键修复：只在 meta.id 变化时重置 frames
+            // 避免服务端先推帧、后到 meta 时清掉已到帧
+            if (m.id !== window.__ow.metaId) {
+              window.__ow.metaId = m.id;
+              window.__ow.meta = m;
+              window.__ow.frames = [];
+            } else {
+              // 同一 id 的 meta 重复到达，只更新 meta 内容
+              window.__ow.meta = m;
+            }
           }
         } catch(e) {}
       } else {
+        // 二进制帧：只接受当前 meta 对应 id 的帧
         (function(d) {
           (function() {
             if (d instanceof ArrayBuffer) return Promise.resolve(d);
@@ -102,15 +123,18 @@ STEALTH_JS = r"""
         })(ev.data);
       }
     });
+
     ws.addEventListener('close', function(e) {
       window.__ow.closed = true;
       window.__ow.closeCode = e.code;
     });
+
     var origSend = ws.send.bind(ws);
     ws.send = function(d) {
       try { window.__ow.sent.push(typeof d === 'string' ? d : '[bin]'); } catch(e) {}
       return origSend(d);
     };
+
     return ws;
   }
   OWWS.prototype = OrigWS.prototype;
@@ -185,7 +209,7 @@ def login_with_discord_token(page, dc_token: str) -> bool:
     try:
         page.goto(SITE_BASE, wait_until="domcontentloaded", timeout=30000)
         wait_for_cloudflare(page)
-        time.sleep(2)
+        page.wait_for_timeout(2000)
         print(f"   首页加载完成，URL: {page.url}")
     except Exception as e:
         print(f"   ⚠️ 首页加载异常: {e}")
@@ -195,7 +219,7 @@ def login_with_discord_token(page, dc_token: str) -> bool:
     try:
         page.goto(login_url, wait_until="domcontentloaded", timeout=30000)
         wait_for_cloudflare(page)
-        time.sleep(3)
+        page.wait_for_timeout(3000)
         print(f"   URL: {page.url}")
     except Exception as e:
         print(f"   ⚠️ 登录页异常: {e}")
@@ -203,7 +227,6 @@ def login_with_discord_token(page, dc_token: str) -> bool:
     print(f"\n📌 第3步：定位登录入口（Clerk / Discord）")
 
     def _click_first_visible(selectors, timeout_each=3000, desc=""):
-        """按顺序尝试每个 selector，点中第一个可见元素并返回 True。"""
         for sel in selectors:
             try:
                 el = page.locator(sel).first
@@ -222,11 +245,9 @@ def login_with_discord_token(page, dc_token: str) -> bool:
 
     current_url = page.url
 
-    # --- 3a. 若已经在 Discord OAuth 上，直接跳过 ---
     if "discord.com" in current_url:
         print(f"   已在 Discord 域，跳过入口点击")
     else:
-        # --- 3b. 优先点 Clerk 入口 ---
         clerk_selectors = [
             "#clerk-signin",
             "button[id='clerk-signin']",
@@ -237,7 +258,7 @@ def login_with_discord_token(page, dc_token: str) -> bool:
 
         if clicked:
             print("   ⏳ 等待 Clerk 界面加载...")
-            time.sleep(4)
+            page.wait_for_timeout(4000)
 
             discord_in_clerk = [
                 "button:has-text('Continue with Discord')",
@@ -248,10 +269,8 @@ def login_with_discord_token(page, dc_token: str) -> bool:
                 "a:has-text('Discord')",
             ]
 
-            # 主文档里点
             _click_first_visible(discord_in_clerk, desc="Clerk 内 Discord")
 
-            # iframe 兜底
             if "discord.com" not in page.url:
                 try:
                     for fr in page.frames:
@@ -269,7 +288,6 @@ def login_with_discord_token(page, dc_token: str) -> bool:
                 except Exception:
                     pass
 
-            # 等待真正跳到 Discord
             try:
                 page.wait_for_url(
                     re.compile(r"discord\.com"),
@@ -280,7 +298,6 @@ def login_with_discord_token(page, dc_token: str) -> bool:
             except Exception:
                 print("   ⚠️ 点击后未自动跳转，继续兜底流程")
 
-        # --- 3c. 兜底：直接找页面上的 Discord 按钮 ---
         if "discord.com" not in page.url and not clicked:
             fallback = [
                 "button:has-text('Sign in with Discord')",
@@ -293,7 +310,6 @@ def login_with_discord_token(page, dc_token: str) -> bool:
             ]
             _click_first_visible(fallback, desc="通用 Discord 入口")
 
-        # --- 3d. 兜底：从源码提取 OAuth URL ---
         if "discord.com" not in page.url:
             print("   尝试从页面源码提取 OAuth 链接...")
             try:
@@ -302,18 +318,16 @@ def login_with_discord_token(page, dc_token: str) -> bool:
                 if m:
                     print(f"   找到 OAuth 链接: {m.group(0)[:80]}...")
                     page.goto(m.group(0), wait_until="domcontentloaded", timeout=30000)
-                    time.sleep(3)
+                    page.wait_for_timeout(3000)
             except Exception as e:
                 print(f"   ⚠️ 源码提取失败: {e}")
 
-    # --- 3e. 等待最终跳到 Discord ---
     if "discord.com" not in page.url:
         print("   等待可能的延迟跳转...")
         for _ in range(15):
-            time.sleep(1)
+            page.wait_for_timeout(1000)
             if "discord.com" in page.url:
                 break
-            # 如果 Clerk 弹窗还在，再点一次
             try:
                 for sel in ["button:has-text('Continue with Discord')",
                             "button.cl-socialButtonsBlockButton",
@@ -321,7 +335,7 @@ def login_with_discord_token(page, dc_token: str) -> bool:
                     el = page.locator(sel).first
                     if el.is_visible(timeout=500):
                         el.click()
-                        time.sleep(2)
+                        page.wait_for_timeout(2000)
                         break
             except Exception:
                 pass
@@ -426,14 +440,14 @@ def login_with_discord_token(page, dc_token: str) -> bool:
         page.goto(location, wait_until="domcontentloaded", timeout=30000)
     except Exception as e:
         print(f"   ⚠️ 回调加载异常（可能正常）: {e}")
-    time.sleep(5)
+    page.wait_for_timeout(5000)
     wait_for_cloudflare(page)
 
     final_url = page.url
     print(f"   回调后 URL: {final_url}")
 
     if "/login" in final_url and "discord" not in final_url:
-        time.sleep(5)
+        page.wait_for_timeout(5000)
         final_url = page.url
         if "/login" in final_url:
             print(f"   ❌ 登录失败，停留在: {final_url}")
@@ -452,45 +466,54 @@ def login_with_discord_token(page, dc_token: str) -> bool:
 # ================= 拼图滑块验证码 =================
 
 def _reset_ow(page):
+    """
+    重置 __ow 状态。
+    关键修复：metaId 一并清空，强制下一次 meta 到达时清空 frames。
+    """
     try:
         page.evaluate("""() => {
-            if (!window.__ow) window.__ow = {};
+            if (!window.__ow) {
+                window.__ow = { meta: null, metaId: null, frames: [],
+                                lastResp: null, sent: [], closed: false,
+                                closeCode: null, ws_refs: [] };
+                return;
+            }
+            window.__ow.meta = null;
+            window.__ow.metaId = null;
             window.__ow.frames = [];
             window.__ow.lastResp = null;
             window.__ow.sent = [];
-            window.__ow.closed = false;
-            window.__ow.closeCode = null;
         }""")
     except Exception:
         pass
 
 
-def _wait_captcha_meta(page, timeout=15):
-    page.wait_for_function(
-        "() => window.__ow && window.__ow.meta && window.__ow.meta.id",
-        timeout=timeout * 1000,
-    )
+def _read_ow_state(page):
+    return page.evaluate("""() => ({
+        meta: window.__ow ? window.__ow.meta : null,
+        metaId: window.__ow ? window.__ow.metaId : null,
+        frames: window.__ow ? window.__ow.frames : [],
+        lastResp: window.__ow ? window.__ow.lastResp : null,
+        sent: window.__ow ? window.__ow.sent : [],
+        closed: window.__ow ? window.__ow.closed : false,
+        closeCode: window.__ow ? window.__ow.closeCode : null,
+    })""")
 
 
-def _wait_captcha_frames(page, timeout=15):
+def _wait_captcha_ready(page, timeout=25):
+    """
+    一步等待 meta + 所有帧到齐。
+    用单个 wait_for_function 避免中间态竞争。
+    """
     page.wait_for_function(
         """() => {
             const o = window.__ow;
-            return o && o.meta && o.frames && o.frames.length >= o.meta.nf;
+            if (!o || !o.meta || !o.meta.id) return false;
+            const nf = o.meta.nf || 1;
+            return Array.isArray(o.frames) && o.frames.length >= nf;
         }""",
         timeout=timeout * 1000,
     )
-
-
-def _read_ow_state(page):
-    return page.evaluate("""() => ({
-        meta: window.__ow.meta,
-        frames: window.__ow.frames,
-        lastResp: window.__ow.lastResp,
-        sent: window.__ow.sent,
-        closed: window.__ow.closed,
-        closeCode: window.__ow.closeCode,
-    })""")
 
 
 def _solve_puzzle(bg_bytes: bytes, piece_bytes: bytes, meta: dict) -> int:
@@ -565,9 +588,9 @@ def _drag_slider(page, value: int, vmax: int):
     start_x = box["x"] + handle_w / 2 + 0.02 * usable
 
     page.mouse.move(start_x, y)
-    time.sleep(random.uniform(0.05, 0.15))
+    page.wait_for_timeout(random.randint(50, 150))
     page.mouse.down()
-    time.sleep(random.uniform(0.05, 0.12))
+    page.wait_for_timeout(random.randint(50, 120))
 
     steps = random.randint(20, 32)
     for i in range(1, steps + 1):
@@ -576,17 +599,17 @@ def _drag_slider(page, value: int, vmax: int):
         x = start_x + (target_x - start_x) * eased
         yy = y + random.uniform(-1.5, 1.5)
         page.mouse.move(x, yy)
-        time.sleep(random.uniform(0.008, 0.022))
+        page.wait_for_timeout(random.randint(8, 22))
 
     for _ in range(3):
         page.mouse.move(target_x + random.uniform(-0.7, 0.7),
                         y + random.uniform(-1.2, 1.2))
-        time.sleep(random.uniform(0.02, 0.05))
+        page.wait_for_timeout(random.randint(20, 50))
 
     page.mouse.up()
 
 
-def _wait_captcha_result(page, timeout=12):
+def _wait_captcha_result(page, timeout=15):
     try:
         page.wait_for_function(
             """() => {
@@ -605,7 +628,10 @@ def _try_renew_once(page, attempt: int, initial_days: int):
     """单次尝试。返回 True=成功 / False=应放弃 / None=继续重试。"""
     print(f"\n   {'='*40}\n   🔄 第 {attempt} 次尝试\n   {'='*40}")
 
-    # 1. 点击 Renew free
+    # 1. 先重置 __ow 状态（关键修复：在点击前重置）
+    _reset_ow(page)
+
+    # 2. 点击 Renew free
     try:
         btn = page.locator("button:has-text('Renew free')").first
         btn.wait_for(state="visible", timeout=8000)
@@ -615,24 +641,28 @@ def _try_renew_once(page, attempt: int, initial_days: int):
         print(f"   ❌ 未找到续期按钮: {e}")
         return None
 
-    # 2. 重置 hook
-    _reset_ow(page)
-
-    # 3. 等 meta
+    # 3. 一步等待 meta + frames 全部就绪
     try:
-        _wait_captcha_meta(page, timeout=15)
+        _wait_captcha_ready(page, timeout=25)
     except Exception as e:
-        print(f"   ❌ 等待 captcha meta 超时: {e}")
+        print(f"   ❌ 等待 captcha meta/frames 超时: {e}")
+        # 打印详细诊断
+        try:
+            st = _read_ow_state(page)
+            meta = st.get("meta")
+            print(f"   🔬 诊断：")
+            print(f"      meta = {json.dumps(meta, ensure_ascii=False) if meta else None}")
+            print(f"      metaId = {st.get('metaId')}")
+            print(f"      frames_len = {len(st.get('frames') or [])}")
+            print(f"      lastResp = {st.get('lastResp')!r}")
+            print(f"      sent = {st.get('sent')}")
+            print(f"      closed = {st.get('closed')}, closeCode = {st.get('closeCode')}")
+        except Exception:
+            pass
         dump_page_debug(page, f"no_meta_{attempt}")
         return None
 
-    # 4. 等帧
-    try:
-        _wait_captcha_frames(page, timeout=15)
-    except Exception as e:
-        print(f"   ❌ 等待 captcha frames 超时: {e}")
-        return None
-
+    # 4. 读取状态
     st = _read_ow_state(page)
     meta = st["meta"]
     kind = meta.get("kind")
@@ -672,7 +702,7 @@ def _try_renew_once(page, attempt: int, initial_days: int):
         return None
 
     # 7. 读响应
-    resp = _wait_captcha_result(page, timeout=12)
+    resp = _wait_captcha_result(page, timeout=15)
     print(f"   📨 服务端响应: {resp!r}")
     if not resp or not resp.startswith("ok:"):
         return None
@@ -690,13 +720,13 @@ def _try_renew_once(page, attempt: int, initial_days: int):
         print(f"   ⚠️ 点击 Confirm Renewal 异常: {e}")
 
     # 9. 验证
-    time.sleep(4)
+    page.wait_for_timeout(4000)
     try:
         page.reload(wait_until="domcontentloaded", timeout=30000)
     except Exception:
         pass
     wait_for_cloudflare(page)
-    time.sleep(2)
+    page.wait_for_timeout(2000)
 
     try:
         text = page.locator("body").inner_text()
@@ -734,10 +764,10 @@ def try_renew_captcha(page, initial_days: int, max_attempts=5) -> bool:
         if attempt < max_attempts:
             try:
                 page.keyboard.press("Escape")
-                time.sleep(0.5)
+                page.wait_for_timeout(500)
                 page.reload(wait_until="domcontentloaded", timeout=30000)
                 wait_for_cloudflare(page)
-                time.sleep(3)
+                page.wait_for_timeout(3000)
             except Exception as e:
                 print(f"   ⚠️ 刷新异常: {e}")
 
@@ -777,7 +807,7 @@ def get_vps_urls(page) -> list:
             print(f"   前往首页 {SITE_BASE} 提取...")
             page.goto(SITE_BASE, wait_until="domcontentloaded", timeout=30000)
             wait_for_cloudflare(page)
-            time.sleep(3)
+            page.wait_for_timeout(3000)
             vps_urls = extract()
         except Exception as e:
             print(f"   ⚠️ 首页提取失败: {e}")
@@ -788,7 +818,7 @@ def get_vps_urls(page) -> list:
                 print(f"   尝试 {SITE_BASE}{sub} ...")
                 page.goto(f"{SITE_BASE}{sub}", wait_until="domcontentloaded", timeout=30000)
                 wait_for_cloudflare(page)
-                time.sleep(3)
+                page.wait_for_timeout(3000)
                 vps_urls = extract()
                 if vps_urls:
                     break
@@ -809,7 +839,7 @@ def get_vps_urls(page) -> list:
 
 def main():
     print("#" * 50)
-    print("   Openworld VPS 自动续期脚本 (v3 - Clerk + 拼图)")
+    print("   Openworld VPS 自动续期脚本 (v4 - 修复帧收集)")
     print("#" * 50)
 
     if not DISCORD_TOKEN:
@@ -863,7 +893,7 @@ def main():
                 except Exception as e:
                     print(f"⚠️ 页面加载异常: {e}")
                 wait_for_cloudflare(page)
-                time.sleep(3)
+                page.wait_for_timeout(3000)
 
                 current_url = page.url
                 page_title = page.title()
