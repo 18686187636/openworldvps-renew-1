@@ -16,6 +16,7 @@ from playwright.sync_api import sync_playwright
 try:
     import numpy as np
     import cv2
+    from numpy.lib.stride_tricks import sliding_window_view
 except ImportError:
     print("❌ 缺少依赖：pip install numpy opencv-python-headless")
     sys.exit(1)
@@ -59,22 +60,13 @@ STEALTH_JS = r"""
 
 
 # ================= WebSocket 状态 =================
-WS_STATE = {
-    "url": None,
-    "meta": None,
-    "frames": [],
-    "last_resp": None,
-    "sent": [],
-    "closed": False,
-}
+WS_STATE = {"url": None, "meta": None, "frames": [], "last_resp": None,
+            "sent": [], "closed": False}
 
 
 def _reset_ws_state():
-    WS_STATE["meta"] = None
-    WS_STATE["frames"] = []
-    WS_STATE["last_resp"] = None
-    WS_STATE["sent"] = []
-    WS_STATE["closed"] = False
+    WS_STATE.update({"meta": None, "frames": [], "last_resp": None,
+                     "sent": [], "closed": False})
 
 
 def _install_ws_hook(page):
@@ -138,7 +130,7 @@ def send_telegram_message(message: str):
         print(f"❌ TG 异常: {e}")
 
 
-def save_screenshot(page, name: str):
+def save_screenshot(page, name):
     try:
         page.screenshot(path=os.path.join(SCREENSHOT_DIR, f"{name}.png"))
         print(f"   📸 {name}.png")
@@ -146,7 +138,7 @@ def save_screenshot(page, name: str):
         print(f"   ⚠️ 截图: {e}")
 
 
-def dump_page_debug(page, name: str):
+def dump_page_debug(page, name):
     save_screenshot(page, name)
     try:
         with open(os.path.join(SCREENSHOT_DIR, f"{name}.html"), "w", encoding="utf-8") as f:
@@ -190,8 +182,8 @@ def login_with_discord_token(page, dc_token: str) -> bool:
     except Exception as e:
         print(f"   ⚠️ 登录页: {e}")
 
-    def _click(selectors, desc=""):
-        for sel in selectors:
+    def _click(sels, desc=""):
+        for sel in sels:
             try:
                 el = page.locator(sel).first
                 if el.is_visible(timeout=3000):
@@ -208,21 +200,18 @@ def login_with_discord_token(page, dc_token: str) -> bool:
                           "[data-clerk-component] button"], "Clerk 入口")
         if clicked:
             page.wait_for_timeout(4000)
-            discord_sels = [
-                "button:has-text('Continue with Discord')",
-                "button.cl-socialButtonsBlockButton",
-                "button[data-localization-key='socialButtonsBlockButton']",
-                "button:has-text('Discord')",
-                "a:has-text('Continue with Discord')",
-            ]
-            _click(discord_sels, "Clerk 内 Discord")
+            d_sels = ["button:has-text('Continue with Discord')",
+                      "button.cl-socialButtonsBlockButton",
+                      "button[data-localization-key='socialButtonsBlockButton']",
+                      "button:has-text('Discord')",
+                      "a:has-text('Continue with Discord')"]
+            _click(d_sels, "Clerk 内 Discord")
             try:
                 page.wait_for_url(re.compile(r"discord\.com"), timeout=20000,
                                   wait_until="domcontentloaded")
                 print("   ✅ 已跳到 Discord")
             except Exception:
                 pass
-
         if "discord.com" not in page.url and not clicked:
             _click(["button:has-text('Sign in with Discord')",
                     "a:has-text('Sign in with Discord')",
@@ -294,7 +283,6 @@ def login_with_discord_token(page, dc_token: str) -> bool:
         return False
 
     if not location:
-        print("   ❌ 无 location")
         return False
 
     try:
@@ -312,81 +300,106 @@ def login_with_discord_token(page, dc_token: str) -> bool:
             return False
 
     print(f"   ✅ 登录成功: {page.url}")
-    save_screenshot(page, "login_success")
     return True
 
 
-# ================= 各类验证码求解 =================
+# ================= 求解器 =================
 
 def _decode(b):
     return cv2.imdecode(np.frombuffer(b, np.uint8), cv2.IMREAD_UNCHANGED)
 
 
-def _solve_puzzle(bg_bytes: bytes, piece_bytes: bytes, meta: dict) -> int:
+def _ncc_match(bg_gray, chip_gray, mask, y_search):
+    """加权 NCC 滑窗。返回 (best_x, best_y, best_score)。"""
+    H, W = bg_gray.shape
+    ph, pw = chip_gray.shape
+    if W < pw or H < ph:
+        return 0, 0, -1.0
+
+    y0, y1 = y_search
+    y0 = max(0, int(y0))
+    y1 = min(H - ph + 1, int(y1))
+    if y1 <= y0:
+        return 0, 0, -1.0
+
+    mask_f = mask.astype(np.float32)
+    mask_sum = float(mask_f.sum())
+    if mask_sum < 1:
+        return 0, 0, -1.0
+
+    chip_f = chip_gray.astype(np.float32)
+    chip_mean = float((chip_f * mask_f).sum() / mask_sum)
+    chip_centered = (chip_f - chip_mean) * mask_f
+    chip_std = float(np.sqrt((chip_centered ** 2).sum() / mask_sum))
+    if chip_std < 1e-6:
+        return 0, 0, -1.0
+    chip_norm = chip_centered / chip_std  # (ph, pw)
+
+    best_score = -1.0
+    best_x = 0
+    best_y = y0
+
+    for y in range(y0, y1):
+        roi = bg_gray[y:y + ph, :].astype(np.float32)  # (ph, W)
+        windows = sliding_window_view(roi, (ph, pw))   # (W-pw+1, ph, pw)
+        weighted = windows * mask_f
+        means = weighted.sum(axis=(1, 2)) / mask_sum
+        centered = (windows - means[:, None, None]) * mask_f
+        stds = np.sqrt((centered ** 2).sum(axis=(1, 2)) / mask_sum) + 1e-6
+        ncc = (centered * chip_norm[None, :, :]).sum(axis=(1, 2)) / (stds * mask_sum)
+        idx = int(np.argmax(ncc))
+        if ncc[idx] > best_score:
+            best_score = float(ncc[idx])
+            best_x = idx
+            best_y = y
+    return best_x, best_y, best_score
+
+
+def _solve_puzzle(bg_bytes, piece_bytes, meta):
     bg = _decode(bg_bytes)
-    piece = _decode(piece_bytes)
-    if bg is None or piece is None:
+    chip = _decode(piece_bytes)
+    if bg is None or chip is None:
         raise RuntimeError("解码失败")
     if bg.ndim == 3:
-        bg = bg[:, :, :3]
+        bg_rgb = bg[:, :, :3]
+    else:
+        bg_rgb = cv2.cvtColor(bg, cv2.COLOR_GRAY2BGR)
 
-    bg_gray = cv2.cvtColor(bg, cv2.COLOR_BGR2GRAY)
-    H, W = bg_gray.shape
-    vmax = int(meta.get("vmax") or W)
+    if chip.ndim != 3 or chip.shape[2] != 4:
+        raise RuntimeError("chip 缺少 alpha")
+
+    bg_gray = cv2.cvtColor(bg_rgb, cv2.COLOR_BGR2GRAY).astype(np.uint8)
+    chip_gray = cv2.cvtColor(chip[:, :, :3], cv2.COLOR_BGR2GRAY).astype(np.uint8)
+    mask = (chip[:, :, 3] > 100).astype(np.uint8)
+
     py = int(meta.get("py", 0))
-    ph = int(meta.get("ph", piece.shape[0]))
+    ph = chip_gray.shape[0]
+    # 目标形状的 y 应与 chip 显示的 y 一致 → 在 py 附近搜索
+    y_range = (py - 20, py + ph + 20)
 
-    if piece.ndim != 3 or piece.shape[2] != 4:
-        raise RuntimeError("piece 缺少 alpha")
+    bx, by, score = _ncc_match(bg_gray, chip_gray, mask, y_range)
+    print(f"   🧪 NCC: best=({bx},{by}) score={score:.3f} (py={py})")
 
-    piece_gray = cv2.cvtColor(piece[:, :, :3], cv2.COLOR_BGR2GRAY)
-    mask = (piece[:, :, 3] > 100).astype(np.uint8)
-
-    y0 = max(0, py - 25)
-    y1 = min(H, py + ph + 25)
-    bg_roi = bg_gray[y0:y1, :]
-
-    best_val, best_x = -1.0, 0
-    for m_name, m in [("CCOEFF", cv2.TM_CCOEFF_NORMED),
-                      ("CCORR",  cv2.TM_CCORR_NORMED)]:
-        try:
-            res = cv2.matchTemplate(bg_roi, piece_gray, m, mask=mask)
-            _, mv, _, ml = cv2.minMaxLoc(res)
-            print(f"   🧪 {m_name}: max={mv:.3f} loc={ml}")
-            if mv > best_val:
-                best_val, best_x = mv, int(ml[0])
-        except Exception as e:
-            print(f"   ⚠️ {m_name}: {e}")
-    return max(0, min(vmax, best_x))
+    vmax = int(meta.get("vmax") or bg_gray.shape[1])
+    return max(0, min(vmax, bx))
 
 
-def _solve_rotate(bg_bytes: bytes, chip_bytes: bytes, meta: dict) -> int:
-    """
-    rotate: chip 显示在 (ox,oy)，尺寸 (ow,oh)，需要旋转某角度后与 bg 匹配。
-    返回要提交的 value（CSS 顺时针度数）。
-    """
+def _solve_rotate(bg_bytes, chip_bytes, meta):
     bg = _decode(bg_bytes)
     chip = _decode(chip_bytes)
     if bg is None or chip is None:
         return 0
-    if bg.ndim == 3:
-        bg = bg[:, :, :3]
-
-    bg_gray = cv2.cvtColor(bg, cv2.COLOR_BGR2GRAY)
-
+    bg_rgb = bg[:, :, :3] if bg.ndim == 3 else cv2.cvtColor(bg, cv2.COLOR_GRAY2BGR)
+    bg_gray = cv2.cvtColor(bg_rgb, cv2.COLOR_BGR2GRAY)
+    H, W = bg_gray.shape
     ox, oy = int(meta["ox"]), int(meta["oy"])
     ow, oh = int(meta["ow"]), int(meta["oh"])
-
-    H, W = bg_gray.shape
-    x0 = max(0, ox - 12)
-    y0 = max(0, oy - 12)
-    x1 = min(W, ox + ow + 12)
-    y1 = min(H, oy + oh + 12)
+    x0 = max(0, ox - 12); y0 = max(0, oy - 12)
+    x1 = min(W, ox + ow + 12); y1 = min(H, oy + oh + 12)
     target = bg_gray[y0:y1, x0:x1]
 
     piece_gray = cv2.cvtColor(chip[:, :, :3], cv2.COLOR_BGR2GRAY)
     piece_mask = (chip[:, :, 3] > 100).astype(np.uint8)
-
     ch, cw = piece_gray.shape
     cx, cy = cw / 2.0, ch / 2.0
 
@@ -394,16 +407,13 @@ def _solve_rotate(bg_bytes: bytes, chip_bytes: bytes, meta: dict) -> int:
     for angle in range(0, 360, 5):
         M = cv2.getRotationMatrix2D((cx, cy), angle, 1.0)
         cos = abs(M[0, 0]); sin = abs(M[0, 1])
-        new_w = int(ch * sin + cw * cos)
-        new_h = int(ch * cos + cw * sin)
-        M[0, 2] += new_w / 2.0 - cx
-        M[1, 2] += new_h / 2.0 - cy
-        rot = cv2.warpAffine(piece_gray, M, (new_w, new_h),
+        nw = int(ch * sin + cw * cos); nh = int(ch * cos + cw * sin)
+        M[0, 2] += nw / 2.0 - cx; M[1, 2] += nh / 2.0 - cy
+        rot = cv2.warpAffine(piece_gray, M, (nw, nh),
                              flags=cv2.INTER_LINEAR, borderValue=0)
-        rot_mask = cv2.warpAffine(piece_mask, M, (new_w, new_h),
+        rot_mask = cv2.warpAffine(piece_mask, M, (nw, nh),
                                   flags=cv2.INTER_NEAREST, borderValue=0)
-        th, tw = target.shape
-        if rot.shape[0] > th or rot.shape[1] > tw:
+        if rot.shape[0] > target.shape[0] or rot.shape[1] > target.shape[1]:
             continue
         try:
             res = cv2.matchTemplate(target, rot, cv2.TM_CCORR_NORMED, mask=rot_mask)
@@ -412,85 +422,71 @@ def _solve_rotate(bg_bytes: bytes, chip_bytes: bytes, meta: dict) -> int:
                 best_score, best_angle = mv, angle
         except Exception:
             continue
-
-    # OpenCV getRotationMatrix2D 正角逆时针
-    # CSS rotate() 正角顺时针 → value = -angle (mod 360)
     submit_value = (360 - best_angle) % 360
-    print(f"   🎯 rotate: best_angle={best_angle} score={best_score:.3f} "
-          f"→ value={submit_value}")
+    print(f"   🎯 rotate: best_angle={best_angle} score={best_score:.3f} → {submit_value}")
     return submit_value
 
 
-def _solve_odd(bg_bytes: bytes, meta: dict) -> int:
+def _solve_odd(bg_bytes, meta):
     bg = _decode(bg_bytes)
     if bg is None:
         return None
-    if bg.ndim == 3:
-        bg = bg[:, :, :3]
-
+    bg_rgb = bg[:, :, :3] if bg.ndim == 3 else cv2.cvtColor(bg, cv2.COLOR_GRAY2BGR)
     items = meta.get("items") or []
     if len(items) < 3:
         return None
-
     feats = []
     for it in items:
         x, y, r = int(it["x"]), int(it["y"]), int(it["r"])
         x1, y1 = max(0, x - r), max(0, y - r)
-        x2, y2 = min(bg.shape[1], x + r), min(bg.shape[0], y + r)
-        patch = bg[y1:y2, x1:x2]
+        x2, y2 = min(bg_rgb.shape[1], x + r), min(bg_rgb.shape[0], y + r)
+        patch = bg_rgb[y1:y2, x1:x2]
         if patch.size == 0:
-            feats.append(None)
-            continue
+            feats.append(None); continue
         hsv = cv2.cvtColor(patch, cv2.COLOR_BGR2HSV)
-        hist = cv2.calcHist([hsv], [0, 1], None, [30, 32], [0, 180, 0, 256])
-        hist = cv2.normalize(hist, hist).flatten().astype(np.float32)
-        feats.append(hist)
-
+        h = cv2.calcHist([hsv], [0, 1], None, [30, 32], [0, 180, 0, 256])
+        h = cv2.normalize(h, h).flatten().astype(np.float32)
+        feats.append(h)
     best_i, best_score = -1, -1.0
     for i, fi in enumerate(feats):
-        if fi is None:
-            continue
-        total, cnt = 0.0, 0
+        if fi is None: continue
+        tot, cnt = 0.0, 0
         for j, fj in enumerate(feats):
-            if i == j or fj is None:
-                continue
-            total += float(cv2.compareHist(fi, fj, cv2.HISTCMP_BHATTACHARYYA))
-            cnt += 1
-        if cnt > 0:
-            avg = total / cnt
-            if avg > best_score:
-                best_score, best_i = avg, i
+            if i == j or fj is None: continue
+            tot += float(cv2.compareHist(fi, fj, cv2.HISTCMP_BHATTACHARYYA)); cnt += 1
+        if cnt and tot / cnt > best_score:
+            best_score, best_i = tot / cnt, i
     return best_i if best_i >= 0 else None
 
 
-# ================= 动作执行 =================
+# ================= 交互动作 =================
 
-def _click_box_at(page, meta, img_x, img_y):
+def _click_box_at(page, meta, ix, iy):
     box = page.locator("#captcha_box_default").bounding_box()
     if not box:
         raise RuntimeError("captcha box 不可见")
     sx = box["width"] / float(meta.get("w", 300))
     sy = box["height"] / float(meta.get("h", 160))
-    px = box["x"] + img_x * sx
-    py = box["y"] + img_y * sy
+    px = box["x"] + ix * sx; py = box["y"] + iy * sy
     page.mouse.move(px, py)
     page.wait_for_timeout(random.randint(80, 160))
     page.mouse.click(px, py)
 
 
-def _drag_slider(page, value: int, vmax: int):
+def _drag_slider(page, value, vmax):
+    """
+    ★ 修正映射：HTML 里 handle.style.left = (3 + 94*frac)%，left 是 handle 中心。
+    """
     track = page.locator("#captcha_track_default")
     track.wait_for(state="visible", timeout=5000)
     box = track.bounding_box()
     if not box:
         raise RuntimeError("track 不可见")
 
-    handle_w = 24
-    usable = max(1.0, box["width"] - handle_w)
     frac = max(0.0, min(1.0, value / max(1, vmax)))
-    target_x = box["x"] + handle_w / 2 + frac * usable
+    target_x = box["x"] + box["width"] * (0.03 + 0.94 * frac)
+    start_x = box["x"] + box["width"] * 0.03
     y = box["y"] + box["height"] / 2
-    start_x = box["x"] + handle_w / 2 + 0.03 * usable
 
     page.mouse.move(start_x, y)
     page.wait_for_timeout(random.randint(80, 200))
@@ -502,12 +498,11 @@ def _drag_slider(page, value: int, vmax: int):
         t = i / steps
         eased = 1 - (1 - t) ** 2
         x = start_x + (target_x - start_x) * eased
-        yy = y + random.uniform(-1.8, 1.8)
-        page.mouse.move(x, yy)
+        page.mouse.move(x, y + random.uniform(-1.8, 1.8))
         page.wait_for_timeout(random.randint(10, 25))
 
-    overshoot = random.uniform(3, 8)
-    page.mouse.move(target_x + overshoot, y + random.uniform(-2, 2))
+    over = random.uniform(3, 8)
+    page.mouse.move(target_x + over, y + random.uniform(-2, 2))
     page.wait_for_timeout(random.randint(50, 90))
     page.mouse.move(target_x - random.uniform(1, 3), y + random.uniform(-1, 1))
     page.wait_for_timeout(random.randint(40, 80))
@@ -516,45 +511,39 @@ def _drag_slider(page, value: int, vmax: int):
     page.mouse.up()
 
 
-# ================= 一关处理 =================
-
-def _handle_one_stage(page, meta, frames, label):
+def _handle_one_stage(page, meta, frames):
     kind = meta.get("kind")
-    print(f"   🎯 {label} kind={kind} nf={meta.get('nf')}")
+    print(f"   🎯 kind={kind} nf={meta.get('nf')} py={meta.get('py')} "
+          f"stage={meta.get('stage')}/{meta.get('stages')}")
 
     if kind in ("puzzle", "key"):
         if len(frames) < 2:
-            print("   ⚠️ nf<2")
-            return False
-        value = _solve_puzzle(frames[0], frames[1], meta)
-        print(f"   🧩 value={value} vmax={meta.get('vmax')}")
+            print("   ⚠️ nf<2"); return False
         try:
+            value = _solve_puzzle(frames[0], frames[1], meta)
+            print(f"   🧩 value={value} vmax={meta.get('vmax')}")
             _drag_slider(page, value, int(meta.get("vmax") or 300))
             return True
         except Exception as e:
-            print(f"   ❌ 拖动: {e}")
-            return False
+            print(f"   ❌ puzzle: {e}"); return False
 
     if kind == "rotate":
         if len(frames) < 2:
-            print("   ⚠️ nf<2")
-            return False
-        value = _solve_rotate(frames[0], frames[1], meta)
-        print(f"   🎯 value={value} vmax={meta.get('vmax')}")
+            print("   ⚠️ nf<2"); return False
         try:
+            value = _solve_rotate(frames[0], frames[1], meta)
+            print(f"   🎯 value={value}")
             _drag_slider(page, value, int(meta.get("vmax") or 359))
             return True
         except Exception as e:
-            print(f"   ❌ 拖动: {e}")
-            return False
+            print(f"   ❌ rotate: {e}"); return False
 
     if kind == "odd":
         if not frames:
             return False
         idx = _solve_odd(frames[0], meta)
         if idx is None:
-            print("   ⚠️ odd 求解失败")
-            return False
+            print("   ⚠️ odd 求解失败"); return False
         items = meta.get("items") or []
         it = items[idx]
         print(f"   🎯 点击 item[{idx}] @({it['x']},{it['y']})")
@@ -562,23 +551,22 @@ def _handle_one_stage(page, meta, frames, label):
             _click_box_at(page, meta, it["x"], it["y"])
             return True
         except Exception as e:
-            print(f"   ❌ 点击: {e}")
-            return False
+            print(f"   ❌ odd: {e}"); return False
 
     print(f"   ⚠️ 未支持 kind: {kind}")
     return False
 
 
-# ================= 单次会话（多 stage） =================
+# ================= 多 stage 会话 =================
 
 def _try_renew_session(page, attempt, initial_days):
     """
-    ★ 关键修复：不再 _reset_ws_state()。
-    页面加载时 captcha 组件已经连上 WS 并收到 meta，我们直接用。
+    ★ 关键修复：
+      - 同 id 不同 py 的挑战视为新挑战（用 (id,py,px,ox,oy) 指纹）
+      - 每关处理完不等待特定响应，让主循环自然检查 meta / last_resp
     """
     print(f"\n   {'='*40}\n   🔄 第 {attempt} 次会话\n   {'='*40}")
 
-    # 打开 renew 弹窗（页面加载时组件已就绪，这里只是触发弹窗显示）
     try:
         btn = page.locator("button:has-text('Renew free')").first
         btn.wait_for(state="visible", timeout=8000)
@@ -588,29 +576,26 @@ def _try_renew_session(page, attempt, initial_days):
         print(f"   ❌ 未找到续期按钮: {e}")
         return None
 
-    # 等 captcha 数据可用（兼容两种：页面加载时已到 / 点了才到）
-    have_meta = False
-    for _ in range(80):  # 最多 16s
+    # 等 captcha 就绪（页面加载时已收到，或弹窗触发后到达）
+    ok = False
+    for _ in range(80):
         if WS_STATE["meta"] and WS_STATE["meta"].get("id"):
-            have_meta = True
-            break
+            ok = True; break
         page.wait_for_timeout(200)
-    if not have_meta:
-        print(f"   ❌ 无 meta: last_resp={WS_STATE['last_resp']!r} "
-              f"url={WS_STATE['url']} closed={WS_STATE['closed']}")
+    if not ok:
+        print(f"   ❌ 无 meta，last_resp={WS_STATE['last_resp']!r}")
         dump_page_debug(page, f"no_meta_{attempt}")
         return None
 
-    handled_ids = set()
-    seen_next = 0
-    start = time.time()
-    max_total = 200
+    handled_fps = set()
     last_action = time.time()
+    start = time.time()
+    max_total = 220
 
     while time.time() - start < max_total:
         resp = WS_STATE["last_resp"]
 
-        # ---- 终点 ----
+        # ---------- 终点 ----------
         if resp and resp.startswith("ok:"):
             token = resp[3:]
             print(f"   🎉 全部通过！token 长度={len(token)}")
@@ -641,39 +626,29 @@ def _try_renew_session(page, attempt, initial_days):
                 if new_days > initial_days:
                     print(f"   ✅ 续期成功！{initial_days} → {new_days} 天")
                     return True
-                print(f"   ❌ 未增加")
+                print("   ❌ 未增加")
                 return None
             print("   ⚠️ 无法解析天数")
-            save_screenshot(page, f"after_renew_a{attempt}")
             return None
 
         if resp in ("burned", "blocked", "rate"):
-            print(f"   ❌ 服务端拒绝: {resp}")
-            return None
+            print(f"   ❌ 服务端拒绝: {resp}"); return None
         if resp and resp.startswith("bot:"):
-            print(f"   ❌ 被识别为 bot: {resp}")
-            return None
+            print(f"   ❌ bot: {resp}"); return None
 
-        # 统计过关
-        if resp and resp.startswith("next:"):
-            n = resp[5:]
-            if n not in ("", str(seen_next)):
-                seen_next += 1
-                print(f"   ✓ 通过第 {seen_next} 关")
-
+        # ---------- 拿 meta ----------
         meta = WS_STATE["meta"]
         if not meta or not meta.get("id"):
             page.wait_for_timeout(300)
-            if time.time() - last_action > 30:
-                print("   ⚠️ 30s 无新 meta，退出")
-                return None
             continue
 
-        meta_id = meta["id"]
-        if meta_id in handled_ids:
+        # ---------- 指纹去重（同 id 不同 py 也视为新挑战） ----------
+        fp = (meta["id"], meta.get("py"), meta.get("px"),
+              meta.get("ox"), meta.get("oy"))
+        if fp in handled_fps:
             page.wait_for_timeout(300)
-            if time.time() - last_action > 30:
-                print("   ⚠️ 30s 无新挑战，退出")
+            if time.time() - last_action > 45:
+                print("   ⚠️ 45s 无新状态，退出")
                 return None
             continue
 
@@ -683,58 +658,46 @@ def _try_renew_session(page, attempt, initial_days):
             continue
 
         frames = list(WS_STATE["frames"])[:nf]
-        handled_ids.add(meta_id)
+        handled_fps.add(fp)
         last_action = time.time()
 
+        # 保存帧
         for i, fb in enumerate(frames):
             try:
+                tag = meta["id"][:6]
+                py = meta.get("py", 0)
                 with open(os.path.join(
                     SCREENSHOT_DIR,
-                    f"captcha_a{attempt}_{meta_id[:6]}_f{i}.png"), "wb") as f:
+                    f"captcha_a{attempt}_{tag}_py{py}_f{i}.png"), "wb") as f:
                     f.write(fb)
             except Exception:
                 pass
 
-        label = f"Stage {meta.get('stage')}/{meta.get('stages')}"
-        prev_resp = WS_STATE["last_resp"]
-        ok = _handle_one_stage(page, meta, frames, label)
+        ok = _handle_one_stage(page, meta, frames)
         if not ok:
             return None
 
-        # 等新响应
-        deadline = time.time() + 15
-        while time.time() < deadline:
-            r = WS_STATE["last_resp"]
-            if r and r != prev_resp:
-                break
-            page.wait_for_timeout(200)
-        r = WS_STATE["last_resp"]
-        print(f"   📨 响应: {r!r}")
-        if r is None or r == prev_resp:
-            print("   ⚠️ 提交后无新响应")
-            return None
-        # ok: / fail / next:N / 服务端都会继续推动，让循环自然处理
+        # 等一会让服务端响应，然后由循环自然进入下一关
+        page.wait_for_timeout(600)
 
     print(f"   ❌ 超时 {max_total}s")
     save_screenshot(page, f"renew_timeout_a{attempt}")
     return None
 
 
-def try_renew_captcha(page, initial_days: int, max_attempts=3) -> bool:
+def try_renew_captcha(page, initial_days, max_attempts=4):
     for attempt in range(1, max_attempts + 1):
         try:
             r = _try_renew_session(page, attempt, initial_days)
         except Exception as e:
             print(f"   ❌ 第 {attempt} 次会话异常: {e}")
-            import traceback
-            traceback.print_exc()
+            import traceback; traceback.print_exc()
             r = None
 
         if r is True:
             return True
 
         if attempt < max_attempts:
-            # ★ 重试必须刷新页面 —— 让 captcha 组件重新连 WS 并拿新 meta
             _reset_ws_state()
             try:
                 page.keyboard.press("Escape")
@@ -751,7 +714,7 @@ def try_renew_captcha(page, initial_days: int, max_attempts=3) -> bool:
 
 # ================= VPS 列表 =================
 
-def get_vps_urls(page) -> list:
+def get_vps_urls(page):
     def extract():
         found = []
         try:
@@ -780,7 +743,6 @@ def get_vps_urls(page) -> list:
             urls = extract()
         except Exception:
             pass
-
     if urls:
         print(f"   ✅ {len(urls)} 个:")
         for u in urls:
@@ -790,120 +752,111 @@ def get_vps_urls(page) -> list:
     return urls
 
 
-# ================= 主流程 =================
+# ================= main =================
 
 def main():
     print("#" * 50)
-    print("   Openworld VPS 自动续期 (v7 - mixed 5 stage)")
+    print("   Openworld VPS 自动续期 (v8 - 指纹去重 + NCC)")
     print("#" * 50)
 
     if not DISCORD_TOKEN:
         print("❌ 未设置 DISCORD_TOKEN")
         sys.exit(1)
 
-    headless_mode = os.environ.get("HEADLESS", "true").lower() == "true"
-    print(f"🖥️  {'无头' if headless_mode else '有头'}")
+    headless = os.environ.get("HEADLESS", "true").lower() == "true"
+    print(f"🖥️  {'无头' if headless else '有头'}")
 
     with sync_playwright() as p:
         browser = p.chromium.launch(
-            headless=headless_mode,
+            headless=headless,
             args=[
                 "--disable-blink-features=AutomationControlled",
-                "--no-sandbox",
-                "--disable-dev-shm-usage",
+                "--no-sandbox", "--disable-dev-shm-usage",
                 "--disable-features=IsolateOrigins,site-per-process",
             ]
         )
-        context = browser.new_context(
-            user_agent=("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-                        "(KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36"),
+        ctx = browser.new_context(
+            user_agent=("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                        "AppleWebKit/537.36 (KHTML, like Gecko) "
+                        "Chrome/130.0.0.0 Safari/537.36"),
             viewport={"width": 1280, "height": 720},
-            locale="en-US",
-            timezone_id="America/New_York",
+            locale="en-US", timezone_id="America/New_York",
         )
-        context.add_init_script(STEALTH_JS)
-        page = context.new_page()
+        ctx.add_init_script(STEALTH_JS)
+        page = ctx.new_page()
         _install_ws_hook(page)
 
         try:
             if not login_with_discord_token(page, DISCORD_TOKEN):
-                print("\n❌ 登录失败")
                 send_telegram_message("❌ 登录流程失败")
                 return
 
             vps_list = get_vps_urls(page)
             if not vps_list:
-                send_telegram_message("❌ 未在面板找到 VPS 实例")
+                send_telegram_message("❌ 未找到 VPS")
                 return
 
-            for idx, target_url in enumerate(vps_list, 1):
+            for idx, url in enumerate(vps_list, 1):
                 print(f"\n{'=' * 50}")
-                print(f"📌 [{idx}/{len(vps_list)}] {target_url}")
+                print(f"📌 [{idx}/{len(vps_list)}] {url}")
                 print(f"{'=' * 50}")
 
-                # ★ 进入新页面之前先 reset（页面加载时 captcha 会重新连 WS 发 new）
                 _reset_ws_state()
-
                 try:
-                    page.goto(target_url, wait_until="domcontentloaded", timeout=30000)
+                    page.goto(url, wait_until="domcontentloaded", timeout=30000)
                 except Exception as e:
                     print(f"⚠️ 加载: {e}")
                 wait_for_cloudflare(page)
                 page.wait_for_timeout(3000)
 
                 if "/login" in page.url:
-                    print("❌ 重定向到登录页")
-                    save_screenshot(page, f"redirect_to_login_{idx}")
+                    print("❌ 被重定向")
                     send_telegram_message("❌ 登录后仍被重定向")
                     break
 
                 try:
-                    page_text = page.locator("body").inner_text()
+                    text = page.locator("body").inner_text()
                 except Exception:
-                    page_text = ""
+                    text = ""
 
                 if "404" in page.title() or "Page Not Found" in page.title():
-                    print(f"❌ 404: {target_url}")
-                    continue
+                    print(f"❌ 404"); continue
 
                 print("✅ 到达 VPS 页面")
                 save_screenshot(page, f"vps_page_loaded_{idx}")
 
-                m = re.search(r"[Rr]enews?\s+in\s+(\d+)\s+days?", page_text)
+                m = re.search(r"[Rr]enews?\s+in\s+(\d+)\s+days?", text)
                 if m:
-                    days_left = int(m.group(1))
-                    print(f"🔍 剩余: {days_left} 天")
-                    if days_left > RENEW_THRESHOLD_DAYS:
+                    days = int(m.group(1))
+                    print(f"🔍 剩余: {days} 天")
+                    if days > RENEW_THRESHOLD_DAYS:
                         print("⏳ 跳过续期")
                         send_telegram_message(
-                            f"ℹ️ 无需续期\n实例: {target_url}\n剩余: {days_left} 天")
+                            f"ℹ️ 无需续期\n实例: {url}\n剩余: {days} 天")
                         continue
-                    print(f"⚠️ {days_left} ≤ {RENEW_THRESHOLD_DAYS}，开始续期")
+                    print(f"⚠️ {days} ≤ {RENEW_THRESHOLD_DAYS}，开始续期")
                 else:
                     print("⚠️ 未解析天数，强制尝试")
-                    days_left = 0
+                    days = 0
 
-                print(f"\n{'=' * 50}\n🔄 开始验证码续期\n{'=' * 50}")
-                ok = try_renew_captcha(page, initial_days=days_left)
+                print(f"\n{'=' * 50}\n🔄 验证码续期\n{'=' * 50}")
+                ok = try_renew_captcha(page, initial_days=days)
 
                 if ok:
                     expiry = datetime.now(timezone(timedelta(hours=8))) + timedelta(days=6)
-                    expiry_str = expiry.strftime("%Y-%m-%d %H:%M:%S") + " (GMT+8)"
-                    print(f"✅ 续期成功，至: {expiry_str}")
+                    es = expiry.strftime("%Y-%m-%d %H:%M:%S") + " (GMT+8)"
+                    print(f"✅ 续期成功，至: {es}")
                     send_telegram_message(
-                        f"✅ 续期成功！\n实例: {target_url}\n续期至: {expiry_str}")
+                        f"✅ 续期成功！\n实例: {url}\n续期至: {es}")
                 else:
                     print("❌ 续期失败")
-                    send_telegram_message(f"❌ 续期失败\n实例: {target_url}")
+                    send_telegram_message(f"❌ 续期失败\n实例: {url}")
 
         except Exception as e:
             print(f"\n💥 异常: {e}")
-            import traceback
-            traceback.print_exc()
-            try:
-                save_screenshot(page, "uncaught_error")
-            except Exception:
-                pass
+            import traceback; traceback.print_exc()
+            try: save_screenshot(page, "uncaught_error")
+            except Exception: pass
             send_telegram_message(f"❌ 异常: {str(e)[:200]}")
 
         finally:
