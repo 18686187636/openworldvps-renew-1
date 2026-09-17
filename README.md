@@ -15,7 +15,6 @@
 | 名称 | 必填 | 说明 |
 |---|---|---|
 | `DISCORD_TOKEN` | ✅ | Discord 账号 Token |
-| `DISCORD_GUILD_ID` | 可选 | 默认 `1525632757072658502` |
 | `TG_BOT_TOKEN` | 可选 | Telegram Bot Token |
 | `TG_CHAT_ID` | 可选 | Telegram Chat ID |
 | `ACCOUNT_NAME` | 可选 | 通知里显示的名字 |
