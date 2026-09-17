@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-# v20-ci: GitHub Actions 版（纯环境变量配置、无头、无 input）
+# apprenew.py — Openworld VPS 自动续期（GitHub Actions 版 + sing-box 代理）
 
 import os
 import re
@@ -23,7 +23,7 @@ except ImportError:
 
 
 # ============================================================
-# 全部从环境变量读取（GitHub Actions Secrets）
+# 环境变量
 # ============================================================
 DISCORD_TOKEN    = os.environ.get("DISCORD_TOKEN", "")
 DISCORD_GUILD_ID = os.environ.get("DISCORD_GUILD_ID", "1525632757072658502")
@@ -33,6 +33,9 @@ ACCOUNT_NAME     = os.environ.get("ACCOUNT_NAME", "Openworld")
 SITE_BASE        = os.environ.get("SITE_BASE", "https://openworld.eu.org")
 HEADLESS         = os.environ.get("HEADLESS", "true").lower() == "true"
 RENEW_THRESHOLD_DAYS = int(os.environ.get("RENEW_THRESHOLD_DAYS", "5"))
+
+# ⭐ 代理
+PROXY_URL = os.environ.get("HTTPS_PROXY") or os.environ.get("ALL_PROXY") or ""
 
 SCREENSHOT_DIR = os.environ.get("SCREENSHOT_DIR", "./screenshots")
 os.makedirs(SCREENSHOT_DIR, exist_ok=True)
@@ -1163,6 +1166,7 @@ def check_config():
     print(f"   TG 通知       : {'✅ 已启用' if (TG_BOT_TOKEN and TG_CHAT_ID) else '⚪ 未启用'}")
     print(f"   SITE_BASE     : {SITE_BASE}")
     print(f"   模式          : {'无头' if HEADLESS else '有头'}")
+    print(f"   代理          : {PROXY_URL if PROXY_URL else '⚪ 未启用'}")
     print(f"   截图目录      : {SCREENSHOT_DIR}")
     return bool(DISCORD_TOKEN)
 
@@ -1171,7 +1175,7 @@ def check_config():
 
 def main():
     print("#" * 60)
-    print("   Openworld VPS 自动续期 (v20-ci GitHub Actions 版)")
+    print("   Openworld VPS 自动续期 (apprenew + sing-box)")
     print("#" * 60)
 
     if not check_config():
@@ -1179,15 +1183,20 @@ def main():
         sys.exit(1)
 
     with sync_playwright() as p:
-        browser = p.chromium.launch(
-            headless=HEADLESS,
-            args=[
+        launch_kwargs = {
+            "headless": HEADLESS,
+            "args": [
                 "--disable-blink-features=AutomationControlled",
                 "--no-sandbox",
                 "--disable-dev-shm-usage",
                 "--disable-features=IsolateOrigins,site-per-process",
-            ]
-        )
+            ],
+        }
+        if PROXY_URL:
+            launch_kwargs["proxy"] = {"server": PROXY_URL}
+            print(f"🌐 Playwright 走代理: {PROXY_URL}")
+
+        browser = p.chromium.launch(**launch_kwargs)
         ctx = browser.new_context(
             user_agent=("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
                         "AppleWebKit/537.36 (KHTML, like Gecko) "
