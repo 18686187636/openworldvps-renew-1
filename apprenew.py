@@ -3,9 +3,9 @@
 # apprenew.py — Openworld VPS 自动续期
 #   - patchright 反检测
 #   - 有头模式 (Xvfb)
-#   - CDP 发鼠标事件（精确时序）
+#   - CDP 发鼠标事件
 #   - 滑块初始位置检测
-#   - ⭐ 修正：sub,0 优先 + 跨会话累积策略索引
+#   - ⭐ 修正：每个 stage 固定 sub,0；match 用颜色+灰度联合匹配
 
 import os
 import re
@@ -18,7 +18,6 @@ import requests
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-# ⭐ 用 patchright 替代 playwright
 from patchright.sync_api import sync_playwright
 
 try:
@@ -53,17 +52,10 @@ SUPPORTED_KINDS = ("puzzle", "key", "rotate", "odd", "match")
 MAX_SWITCH_PER_SESSION = 8
 MAX_FAIL_PER_SESSION = 5
 
-# ⭐ 修正：sub,0 放第一位（正确答案 = shape_cx - alpha_cx - px）
+# ⭐ 只保留最可能正确的公式
+#   sub,0 = shape_cx - alpha_cx - px
 ALIGN_STRATEGIES = [
-    ("sub",   0),   # shape_cx - alpha_cx - px   ← 正确公式
-    ("sub",  -1),
-    ("sub",  +1),
-    ("sub",  -2),
-    ("sub",  +2),
-    ("none",  0),   # shape_cx - alpha_cx
-    ("none", -1),
-    ("none", +1),
-    ("add",   0),
+    ("sub", 0),
 ]
 
 ROTATE_NCC_MIN = 0.35
@@ -480,13 +472,13 @@ def _solve_puzzle(bg_bytes, chip_bytes, meta, align_idx=0):
 
     print(f"   🎯 bbox=({x},{y},{w},{h}) score={best_score:.2f} "
           f"shape_cx={shape_cx:.1f} alpha_cx={alpha_cx:.1f} px={px} pw={pw} "
-          f"strategy=#{align_idx % len(ALIGN_STRATEGIES)}({mode},{offset:+d}) → value={value}")
+          f"strategy=({mode},{offset:+d}) → value={value}")
 
     try:
         vis = bg_rgb.copy()
         cv2.rectangle(vis, (x, y), (x + w, y + h), (0, 0, 255), 2)
         cv2.imwrite(os.path.join(SCREENSHOT_DIR,
-                                 f"puzzle_align_{meta['id'][:6]}_a{align_idx}.png"), vis)
+                                 f"puzzle_align_{meta['id'][:6]}.png"), vis)
     except Exception as e:
         print(f"   ⚠️ 可视化: {e}")
 
@@ -665,7 +657,32 @@ def _solve_odd(bg_bytes, meta):
     return int(items[si]["x"])
 
 
-def _solve_match(bg_bytes, meta):
+# ⭐ 新的 match 求解：灰度 NCC + 颜色直方图联合
+def _match_features(gray, rgb, it):
+    x, y, r = int(it["x"]), int(it["y"]), int(it.get("r") or 24)
+    g = gray[max(0, y - r):y + r, max(0, x - r):x + r].astype(np.float32)
+    c = rgb[max(0, y - r):y + r, max(0, x - r):x + r]
+    hists = []
+    for k in range(3):
+        h = cv2.calcHist([c.astype(np.uint8)], [k], None, [16], [0, 256])
+        h = h.flatten() / (h.sum() + 1e-6)
+        hists.append(h)
+    return g, np.concatenate(hists).astype(np.float32)
+
+
+def _match_score(g1, h1, g2, h2):
+    # 灰度 NCC
+    av = g1 - g1.mean()
+    bv = g2 - g2.mean()
+    d = float(np.sqrt((av * av).sum() * (bv * bv).sum()))
+    ncc = float((av * bv).sum() / d) if d > 1e-6 else 0.0
+    # 颜色直方图相关
+    hc = float(cv2.compareHist(h1, h2, cv2.HISTCMP_CORREL))
+    # 综合
+    return 0.3 * ncc + 0.7 * hc, ncc, hc
+
+
+def _match_map_calc(bg_bytes, meta):
     bg = _decode(bg_bytes)
     if bg is None:
         raise RuntimeError("解码失败")
@@ -677,44 +694,48 @@ def _solve_match(bg_bytes, meta):
     if len(left) != 3 or len(right) != 3:
         raise RuntimeError("match left/right 需各 3 个")
 
-    def _patch(it):
-        x, y, r = int(it["x"]), int(it["y"]), int(it.get("r") or 24)
-        sub = gray[max(0, y - r):y + r, max(0, x - r):x + r]
-        return sub.astype(np.float32)
+    lf = [_match_features(gray, rgb, it) for it in left]
+    rf = [_match_features(gray, rgb, it) for it in right]
 
-    lp = [_patch(it) for it in left]
-    rp = [_patch(it) for it in right]
-    h = min(p.shape[0] for p in lp + rp)
-    w = min(p.shape[1] for p in lp + rp)
-    lp = [cv2.resize(p, (w, h)) for p in lp]
-    rp = [cv2.resize(p, (w, h)) for p in rp]
-
-    def _ncc(a, b):
-        av = a - a.mean()
-        bv = b - b.mean()
-        d = float(np.sqrt((av * av).sum() * (bv * bv).sum()))
-        return float((av * bv).sum() / d) if d > 1e-6 else 0.0
+    # 统一尺寸
+    h = min(p[0].shape[0] for p in lf + rf)
+    w = min(p[0].shape[1] for p in lf + rf)
+    def _rz(p):
+        return cv2.resize(p[0], (w, h)), p[1]
+    lf = [_rz(p) for p in lf]
+    rf = [_rz(p) for p in rf]
 
     match_map = []
     used = set()
     for i in range(3):
-        sims = [(_ncc(lp[i], rp[j]), j) for j in range(3)]
+        sims = []
+        for j in range(3):
+            s, ncc, hc = _match_score(lf[i][0], lf[i][1], rf[j][0], rf[j][1])
+            sims.append((s, j, ncc, hc))
         sims.sort(reverse=True)
-        for _, j in sims:
+        top = sims[:3]
+        print(f"      left#{i} 匹配: " +
+              ", ".join(f"R{j}(s={s:.2f},ncc={ncc:.2f},h={hc:.2f})"
+                        for s, j, ncc, hc in top))
+        for _, j, _, _ in sims:
             if j not in used:
                 used.add(j)
                 match_map.append(j)
                 break
         else:
             match_map.append(0)
-    print(f"   🎨 match 配对: {match_map}")
-    return match_map[0] * 100 + match_map[1] * 10 + match_map[2]
+    return match_map
 
 
-# ================= 交互（CDP 直发鼠标事件）=================
+def _solve_match(bg_bytes, meta):
+    mm = _match_map_calc(bg_bytes, meta)
+    print(f"   🎨 match 配对: {mm}")
+    return mm[0] * 100 + mm[1] * 10 + mm[2]
+
+
+# ================= 交互（CDP）=================
 
 def _cdp(page):
-    """拿一个 CDP session（每次新建，避免 stale）"""
     return page.context.new_cdp_session(page)
 
 
@@ -756,13 +777,11 @@ def _box_pos_to_page(page, x, y):
 
 
 def _human_move(session, cx, cy, tx, ty, total_s=None):
-    """从 (cx,cy) 自然移动到 (tx,ty)，用 CDP 发事件，用 perf_counter 精确控制时序。"""
     if total_s is None:
         total_s = random.uniform(0.35, 0.7)
     steps = random.randint(18, 28)
 
     def ease(t):
-        # 加速 → 减速
         return t * t * (3 - 2 * t)
 
     t0 = _time.perf_counter()
@@ -784,13 +803,11 @@ def _click_captcha_point(page, x, y):
     bb = box.bounding_box()
 
     s = _cdp(page)
-    # 起手：先随便 hover 一下
     hx = bb["x"] + bb["width"] * random.uniform(0.2, 0.8)
     hy = bb["y"] + bb["height"] * random.uniform(0.2, 0.8)
     _cdp_move(s, hx, hy)
     _time.sleep(random.uniform(0.12, 0.26))
 
-    # 移到目标
     _human_move(s, hx, hy, px, py, total_s=random.uniform(0.4, 0.8))
     _time.sleep(random.uniform(0.05, 0.12))
     _cdp_down(s, px, py)
@@ -805,10 +822,14 @@ def _click_match_pairs(page, meta):
     if len(left) != 3 or len(right) != 3:
         raise RuntimeError("match left/right 需各 3 个")
 
-    match_map = _match_map_for_click(page, meta)
-    s = _cdp(page)
-    last_x, last_y = 400, 300  # 从任意位置开始
+    frames = WS_STATE.get("frames") or []
+    if not frames:
+        raise RuntimeError("无验证码帧")
+    match_map = _match_map_calc(frames[0], meta)
+    print(f"   🖱️ match 点击配对: {match_map}")
 
+    s = _cdp(page)
+    last_x, last_y = 400, 300
     for i in range(3):
         for it in (left[i], right[match_map[i]]):
             px, py = _box_pos_to_page(page, it["x"], it["y"])
@@ -823,68 +844,13 @@ def _click_match_pairs(page, meta):
     _time.sleep(0.5)
 
 
-def _match_map_for_click(page, meta):
-    frames = WS_STATE.get("frames") or []
-    if not frames:
-        raise RuntimeError("无验证码帧")
-    return _match_map_calc(frames[0], meta)
-
-
-def _match_map_calc(bg_bytes, meta):
-    bg = _decode(bg_bytes)
-    if bg is None:
-        raise RuntimeError("解码失败")
-    rgb = bg[:, :, :3] if bg.ndim == 3 else cv2.cvtColor(bg, cv2.COLOR_GRAY2BGR)
-    gray = cv2.cvtColor(rgb, cv2.COLOR_BGR2GRAY)
-
-    left = meta.get("left") or []
-    right = meta.get("right") or []
-
-    def _patch(it):
-        x, y, r = int(it["x"]), int(it["y"]), int(it.get("r") or 24)
-        sub = gray[max(0, y - r):y + r, max(0, x - r):x + r]
-        return sub.astype(np.float32)
-
-    lp = [_patch(it) for it in left]
-    rp = [_patch(it) for it in right]
-    h = min(p.shape[0] for p in lp + rp)
-    w = min(p.shape[1] for p in lp + rp)
-    lp = [cv2.resize(p, (w, h)) for p in lp]
-    rp = [cv2.resize(p, (w, h)) for p in rp]
-
-    def _ncc(a, b):
-        av = a - a.mean()
-        bv = b - b.mean()
-        d = float(np.sqrt((av * av).sum() * (bv * bv).sum()))
-        return float((av * bv).sum() / d) if d > 1e-6 else 0.0
-
-    match_map = []
-    used = set()
-    for i in range(3):
-        sims = [(_ncc(lp[i], rp[j]), j) for j in range(3)]
-        sims.sort(reverse=True)
-        for _, j in sims:
-            if j not in used:
-                used.add(j)
-                match_map.append(j)
-                break
-        else:
-            match_map.append(0)
-    return match_map
-
-
 def _drag_slider(page, value, vmax):
-    """
-    拖动滑块。
-    ⭐ 关键：先读 handle 的真实初始位置（可能不在最左），再计算相对位移。
-    """
     track = page.locator("#captcha_track_default")
     track.wait_for(state="visible", timeout=5000)
     box = track.bounding_box()
     if not box:
         raise RuntimeError("track 不可见")
 
-    # === 读真实初始状态 ===
     probe = page.evaluate("""() => {
         const out = {};
         const h = document.getElementById('captcha_handle_default');
@@ -903,8 +869,7 @@ def _drag_slider(page, value, vmax):
         return out;
     }""")
     print(f"   🔬 滑块初始: style.left={probe.get('handle_style_left')!r} "
-          f"handle_rect={probe.get('handle_rect')} "
-          f"track_rect={probe.get('track_rect')}")
+          f"handle_rect={probe.get('handle_rect')}")
 
     h_r = probe.get("handle_rect") or {}
     t_r = probe.get("track_rect") or {}
@@ -916,28 +881,23 @@ def _drag_slider(page, value, vmax):
     start_frac = max(0.0, min(1.0, (handle_x - track_x) / usable))
     start_value = start_frac * vmax
     print(f"      📐 推算 start_value ≈ {start_value:.1f}/{vmax} "
-          f"(handle.x={handle_x:.1f}, track.x={track_x:.1f}, usable={usable:.1f})")
+          f"(handle.x={handle_x:.1f}, track.x={track_x:.1f})")
 
     target_frac = max(0.0, min(1.0, value / max(1, vmax)))
     target_x = box["x"] + hw / 2 + target_frac * usable
     start_x  = handle_x + hw / 2
     y = box["y"] + box["height"] / 2
 
-    # === 用 CDP 发事件，精确时序 ===
     s = _cdp(page)
-
-    # 先把鼠标挪到 handle 附近
     _human_move(s, start_x - random.uniform(80, 200), y - random.uniform(30, 80),
                 start_x, y, total_s=random.uniform(0.3, 0.5))
     _time.sleep(random.uniform(0.1, 0.2))
     _cdp_down(s, start_x, y)
 
-    # 拖动：总时长 1.0~1.6s，30~45 步
     total_s = random.uniform(1.0, 1.6)
     steps = random.randint(30, 45)
 
     def ease(t):
-        # 加速-匀速-减速，尾段慢
         if t < 0.15:
             return (t / 0.15) ** 2 * 0.12
         if t < 0.80:
@@ -952,12 +912,10 @@ def _drag_slider(page, value, vmax):
         now = _time.perf_counter()
         if target_t > now:
             _time.sleep(target_t - now)
-
         x = start_x + (target_x - start_x) * ease(t)
         yj = random.gauss(0, 1.2)
         _cdp_move(s, x, y + yj, buttons=1)
 
-    # 过冲回拉
     _time.sleep(random.uniform(0.05, 0.1))
     over = random.uniform(3, 6)
     _cdp_move(s, target_x + over, y + random.uniform(-2, 2), buttons=1)
@@ -966,13 +924,12 @@ def _drag_slider(page, value, vmax):
     _time.sleep(random.uniform(0.04, 0.08))
     _cdp_move(s, target_x + random.uniform(-1, 1), y + random.uniform(-1, 1), buttons=1)
     _time.sleep(random.uniform(0.03, 0.06))
-
     _cdp_up(s, target_x, y)
 
 
 # ================= 一关处理 =================
 
-def _handle_one_stage(page, meta, frames, tag="", align_idx=0):
+def _handle_one_stage(page, meta, frames, tag=""):
     kind = meta.get("kind")
     alt = meta.get("alt")
     print(f"   🎯 kind={kind} nf={meta.get('nf')} "
@@ -996,7 +953,7 @@ def _handle_one_stage(page, meta, frames, tag="", align_idx=0):
             print("   ⚠️ nf<2")
             return False
         try:
-            value = _solve_puzzle(frames[0], frames[1], meta, align_idx=align_idx)
+            value = _solve_puzzle(frames[0], frames[1], meta, align_idx=0)
             print(f"   🧩 value={value} vmax={meta.get('vmax')}")
             _drag_slider(page, value, int(meta.get("vmax") or 300))
             return True
@@ -1172,9 +1129,7 @@ def _try_renew_session(page, attempt, initial_days):
             except Exception:
                 pass
 
-        align_idx = ALIGN_STATE["counter"]
-        result = _handle_one_stage(page, meta, frames,
-                                   tag=tag, align_idx=align_idx)
+        result = _handle_one_stage(page, meta, frames, tag=tag)
 
         if result == "switched":
             switch_count += 1
@@ -1187,7 +1142,6 @@ def _try_renew_session(page, attempt, initial_days):
         if not result:
             return None
 
-        ALIGN_STATE["counter"] += 1
         page.wait_for_timeout(600)
 
     print(f"   ❌ 超时 {max_total}s")
@@ -1196,11 +1150,7 @@ def _try_renew_session(page, attempt, initial_days):
 
 
 def try_renew_captcha(page, initial_days, max_attempts=6):
-    # ⭐ 修正：counter 只在最开头重置一次，跨会话累积
-    ALIGN_STATE["counter"] = 0
-
     for attempt in range(1, max_attempts + 1):
-        # ⭐ 不再每次 _reset_align_pick()
         try:
             r = _try_renew_session(page, attempt, initial_days)
         except Exception as e:
@@ -1288,7 +1238,7 @@ def check_config():
 def main():
     print("#" * 60)
     print("   Openworld VPS 自动续期 (patchright + headed + CDP)")
-    print("   ⭐ 修正: sub,0 优先 + 跨会话累积策略")
+    print("   ⭐ 修正: 固定 sub,0 + match 颜色特征")
     print("#" * 60)
 
     if not check_config():
