@@ -5,7 +5,7 @@
 #   - 有头模式 (Xvfb)
 #   - CDP 发鼠标事件
 #   - 滑块初始位置检测
-#   - ⭐ 修正：每个 stage 固定 sub,0；match 用颜色+灰度联合匹配
+#   - ⭐ 修正：puzzle/key 固定 sub,0；rotate 边缘匹配
 
 import os
 import re
@@ -52,13 +52,12 @@ SUPPORTED_KINDS = ("puzzle", "key", "rotate", "odd", "match")
 MAX_SWITCH_PER_SESSION = 8
 MAX_FAIL_PER_SESSION = 5
 
-# ⭐ 只保留最可能正确的公式
-#   sub,0 = shape_cx - alpha_cx - px
+# ⭐ puzzle/key 只保留最可能正确的公式
 ALIGN_STRATEGIES = [
     ("sub", 0),
 ]
 
-ROTATE_NCC_MIN = 0.35
+ROTATE_MATCH_MIN = 0.10
 ALIGN_STATE = {"counter": 0}
 
 
@@ -486,49 +485,73 @@ def _solve_puzzle(bg_bytes, chip_bytes, meta, align_idx=0):
 
 
 def _solve_rotate(bg_bytes, chip_bytes, meta, tag=""):
+    """
+    rotate: chip 需要旋转到与 bg 虚线圆内"半透明 ghost"重合。
+    ⭐ 用边缘匹配：chip 的 alpha 轮廓 + bg 在圆内的边缘（虚线圆环 mask 掉），
+       距离变换后统计 chip 边缘落在 target 边缘附近的比例。
+    """
     bg = _decode(bg_bytes)
     chip = _decode(chip_bytes)
     if bg is None or chip is None:
         return -1
     bg_rgb = bg[:, :, :3] if bg.ndim == 3 else cv2.cvtColor(bg, cv2.COLOR_GRAY2BGR)
-    bg_gray = cv2.cvtColor(bg_rgb, cv2.COLOR_BGR2GRAY)
-    H, W = bg_gray.shape
+    H, W = bg_rgb.shape[:2]
 
     ox, oy = int(meta["ox"]), int(meta["oy"])
     ow, oh = int(meta["ow"]), int(meta["oh"])
 
-    pad = 30
+    # ---- chip 轮廓 ----
+    if chip.ndim != 3 or chip.shape[2] != 4:
+        return -1
+    chip_rgb = chip[:, :, :3]
+    chip_alpha = chip[:, :, 3]
+    ys, xs = np.where(chip_alpha > 200)
+    if len(xs) < 50:
+        return -1
+    cy0, cy1 = int(ys.min()), int(ys.max()) + 1
+    cx0, cx1 = int(xs.min()), int(xs.max()) + 1
+    chip_alpha_c = chip_alpha[cy0:cy1, cx0:cx1]
+    chip_gray_c = cv2.cvtColor(chip_rgb[cy0:cy1, cx0:cx1], cv2.COLOR_BGR2GRAY)
+
+    # 外轮廓 + 内部边缘
+    chip_outline = cv2.Canny(chip_alpha_c, 100, 200)
+    chip_inner = cv2.Canny(cv2.GaussianBlur(chip_gray_c, (3, 3), 0), 40, 100)
+    chip_edges = cv2.bitwise_or(chip_outline, chip_inner)
+    ch, cw = chip_alpha_c.shape
+    n_edges = int((chip_edges > 0).sum())
+    print(f"   📐 chip: {cw}x{ch}, edges={n_edges}")
+    if n_edges < 30:
+        return -1
+
+    # ---- target 区域（含 padding）----
+    pad = 15
     x0 = max(0, ox - pad); y0 = max(0, oy - pad)
     x1 = min(W, ox + ow + pad); y1 = min(H, oy + oh + pad)
-    target = bg_gray[y0:y1, x0:x1]
-    th, tw = target.shape
+    target = bg_rgb[y0:y1, x0:x1]
+    th, tw = target.shape[:2]
 
-    if chip.ndim == 3 and chip.shape[2] == 4:
-        chip_rgb = chip[:, :, :3]
-        chip_alpha = chip[:, :, 3]
-    else:
-        chip_rgb = chip[:, :, :3] if chip.ndim == 3 else cv2.cvtColor(chip, cv2.COLOR_GRAY2BGR)
-        cg = cv2.cvtColor(chip_rgb, cv2.COLOR_BGR2GRAY)
-        _, chip_alpha = cv2.threshold(cg, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    target_gray = cv2.cvtColor(target, cv2.COLOR_BGR2GRAY)
+    target_edges = cv2.Canny(cv2.GaussianBlur(target_gray, (3, 3), 0.8), 40, 100)
 
-    if chip_alpha.max() > 100:
-        ys, xs = np.where(chip_alpha > 100)
-        if len(xs) > 0:
-            cx0, cx1 = int(xs.min()), int(xs.max()) + 1
-            cy0, cy1 = int(ys.min()), int(ys.max()) + 1
-            chip_gray = cv2.cvtColor(chip_rgb[cy0:cy1, cx0:cx1], cv2.COLOR_BGR2GRAY)
-            chip_mask = chip_alpha[cy0:cy1, cx0:cx1]
-        else:
-            chip_gray = cv2.cvtColor(chip_rgb, cv2.COLOR_BGR2GRAY)
-            chip_mask = chip_alpha
-    else:
-        chip_gray = cv2.cvtColor(chip_rgb, cv2.COLOR_BGR2GRAY)
-        chip_mask = chip_alpha
-
-    ch, cw = chip_gray.shape
-    ccx, ccy = cw / 2.0, ch / 2.0
+    # ---- mask 掉虚线圆环 ----
     tgt_cx = (ox + ow / 2.0) - x0
     tgt_cy = (oy + oh / 2.0) - y0
+    yy, xx = np.mgrid[0:th, 0:tw].astype(np.float32)
+    rr = np.sqrt((xx - tgt_cx) ** 2 + (yy - tgt_cy) ** 2)
+    ring_r = ow / 2.0
+    ring = (rr > ring_r - 8) & (rr < ring_r + 8)
+    target_edges_clean = target_edges.copy()
+    target_edges_clean[ring] = 0
+    target_edges_clean[rr > ring_r + 5] = 0
+
+    n_t = int((target_edges_clean > 0).sum())
+    print(f"   📐 target_edges(clean): {n_t}")
+
+    # ---- 距离变换 ----
+    inv = 255 - target_edges_clean
+    dist_map = cv2.distanceTransform(inv, cv2.DIST_L2, 3)
+
+    ccx, ccy = cw / 2.0, ch / 2.0
 
     def _score(angle):
         M = cv2.getRotationMatrix2D((ccx, ccy), angle, 1.0)
@@ -537,69 +560,71 @@ def _solve_rotate(bg_bytes, chip_bytes, meta, tag=""):
         nh = int(np.ceil(ch * cos_a + cw * sin_a))
         M[0, 2] += nw / 2.0 - ccx
         M[1, 2] += nh / 2.0 - ccy
-        rot = cv2.warpAffine(chip_gray, M, (nw, nh),
-                             flags=cv2.INTER_LINEAR, borderValue=0)
-        rot_m = cv2.warpAffine(chip_mask, M, (nw, nh),
+        rot_e = cv2.warpAffine(chip_edges, M, (nw, nh),
                                flags=cv2.INTER_NEAREST, borderValue=0)
         px = int(round(tgt_cx - nw / 2.0))
         py = int(round(tgt_cy - nh / 2.0))
         tx0, ty0 = max(0, px), max(0, py)
         tx1, ty1 = min(tw, px + nw), min(th, py + nh)
         if tx1 <= tx0 or ty1 <= ty0:
-            return -1.0, rot, rot_m, px, py
+            return -1.0
         rx0, ry0 = tx0 - px, ty0 - py
         rx1 = rx0 + (tx1 - tx0); ry1 = ry0 + (ty1 - ty0)
-        a = target[ty0:ty1, tx0:tx1].astype(np.float32)
-        b = rot[ry0:ry1, rx0:rx1].astype(np.float32)
-        m = rot_m[ry0:ry1, rx0:rx1] > 0
-        if m.sum() < 200:
-            return -1.0, rot, rot_m, px, py
-        av = a[m] - a[m].mean()
-        bv = b[m] - b[m].mean()
-        d = float(np.sqrt((av * av).sum()) * np.sqrt((bv * bv).sum()))
-        if d < 1e-6:
-            return -1.0, rot, rot_m, px, py
-        return float((av * bv).sum() / d), rot, rot_m, px, py
+        ce = rot_e[ry0:ry1, rx0:rx1] > 0
+        n = int(ce.sum())
+        if n < 20:
+            return -1.0
+        d = dist_map[ty0:ty1, tx0:tx1]
+        return float((d[ce] < 4).mean())
 
+    # ---- 三级搜索：3° → ±3° → ±1/±0.5° ----
     best_angle, best_score = 0, -1.0
-    best_rot = best_rot_m = None
-    best_px = best_py = 0
-
     for angle in range(0, 360, 3):
-        s, rot, rot_m, px, py = _score(angle)
+        s = _score(angle)
         if s > best_score:
             best_score, best_angle = s, angle
-            best_rot, best_rot_m = rot, rot_m
-            best_px, best_py = px, py
-    for da in (-2, -1, 1, 2):
-        angle = (best_angle + da) % 360
-        s, rot, rot_m, px, py = _score(angle)
+    for da in range(-3, 4):
+        a = (best_angle + da) % 360
+        s = _score(a)
         if s > best_score:
-            best_score, best_angle = s, angle
-            best_rot, best_rot_m = rot, rot_m
-            best_px, best_py = px, py
+            best_score, best_angle = s, a
+    for da in (-1, -0.5, 0.5, 1):
+        a = (best_angle + da) % 360
+        s = _score(a)
+        if s > best_score:
+            best_score, best_angle = s, a
 
-    print(f"   🎯 rotate: 逆时针={best_angle}° ncc={best_score:.3f}")
+    print(f"   🎯 rotate(edge): 逆时针={best_angle}° 匹配率={best_score:.3f}")
 
+    # ---- 可视化 ----
     try:
-        if best_rot is not None:
-            vis = cv2.cvtColor(target, cv2.COLOR_GRAY2BGR)
-            h2, w2 = best_rot.shape
-            tx0, ty0 = max(0, best_px), max(0, best_py)
-            tx1, ty1 = min(tw, best_px + w2), min(th, best_py + h2)
-            rx0, ry0 = tx0 - best_px, ty0 - best_py
+        vis = cv2.cvtColor(target_gray, cv2.COLOR_GRAY2BGR)
+        vis[target_edges_clean > 0] = (0, 255, 255)   # 黄 = target 边缘
+        M = cv2.getRotationMatrix2D((ccx, ccy), best_angle, 1.0)
+        cos_a, sin_a = abs(M[0, 0]), abs(M[0, 1])
+        nw = int(np.ceil(ch * sin_a + cw * cos_a))
+        nh = int(np.ceil(ch * cos_a + cw * sin_a))
+        M[0, 2] += nw / 2.0 - ccx
+        M[1, 2] += nh / 2.0 - ccy
+        rot_e = cv2.warpAffine(chip_edges, M, (nw, nh),
+                               flags=cv2.INTER_NEAREST, borderValue=0)
+        px = int(round(tgt_cx - nw / 2.0))
+        py = int(round(tgt_cy - nh / 2.0))
+        tx0, ty0 = max(0, px), max(0, py)
+        tx1, ty1 = min(tw, px + nw), min(th, py + nh)
+        if tx1 > tx0 and ty1 > ty0:
+            rx0, ry0 = tx0 - px, ty0 - py
             rx1 = rx0 + (tx1 - tx0); ry1 = ry0 + (ty1 - ty0)
-            m3 = (best_rot_m[ry0:ry1, rx0:rx1] > 0)
-            sub = vis[ty0:ty1, tx0:tx1]
-            sub[m3] = (sub[m3] * 0.5 +
-                       np.array([0, 0, 255]) * 0.5).astype(np.uint8)
-            cv2.imwrite(os.path.join(SCREENSHOT_DIR,
-                                     f"rotate_vis_{tag}.png"), vis)
+            sub = rot_e[ry0:ry1, rx0:rx1] > 0
+            vis[ty0:ty1, tx0:tx1][sub] = (0, 0, 255)   # 红 = chip 边缘
+        cv2.putText(vis, f"ang={best_angle} match={best_score:.2f}",
+                    (5, 15), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1)
+        cv2.imwrite(os.path.join(SCREENSHOT_DIR, f"rotate_vis_{tag}.png"), vis)
     except Exception as e:
         print(f"   ⚠️ 可视化: {e}")
 
-    if best_score < ROTATE_NCC_MIN:
-        print(f"   ⚠️ NCC 低于阈值 {ROTATE_NCC_MIN}，放弃本次提交")
+    if best_score < ROTATE_MATCH_MIN:
+        print(f"   ⚠️ 匹配率过低 ({best_score:.3f})，放弃")
         return -1
 
     return (360 - best_angle) % 360
@@ -657,7 +682,8 @@ def _solve_odd(bg_bytes, meta):
     return int(items[si]["x"])
 
 
-# ⭐ 新的 match 求解：灰度 NCC + 颜色直方图联合
+# ================= match（颜色+灰度联合）=================
+
 def _match_features(gray, rgb, it):
     x, y, r = int(it["x"]), int(it["y"]), int(it.get("r") or 24)
     g = gray[max(0, y - r):y + r, max(0, x - r):x + r].astype(np.float32)
@@ -671,14 +697,11 @@ def _match_features(gray, rgb, it):
 
 
 def _match_score(g1, h1, g2, h2):
-    # 灰度 NCC
     av = g1 - g1.mean()
     bv = g2 - g2.mean()
     d = float(np.sqrt((av * av).sum() * (bv * bv).sum()))
     ncc = float((av * bv).sum() / d) if d > 1e-6 else 0.0
-    # 颜色直方图相关
     hc = float(cv2.compareHist(h1, h2, cv2.HISTCMP_CORREL))
-    # 综合
     return 0.3 * ncc + 0.7 * hc, ncc, hc
 
 
@@ -697,7 +720,6 @@ def _match_map_calc(bg_bytes, meta):
     lf = [_match_features(gray, rgb, it) for it in left]
     rf = [_match_features(gray, rgb, it) for it in right]
 
-    # 统一尺寸
     h = min(p[0].shape[0] for p in lf + rf)
     w = min(p[0].shape[1] for p in lf + rf)
     def _rz(p):
@@ -1238,7 +1260,7 @@ def check_config():
 def main():
     print("#" * 60)
     print("   Openworld VPS 自动续期 (patchright + headed + CDP)")
-    print("   ⭐ 修正: 固定 sub,0 + match 颜色特征")
+    print("   ⭐ sub,0 for puzzle/key, edge-match for rotate")
     print("#" * 60)
 
     if not check_config():
