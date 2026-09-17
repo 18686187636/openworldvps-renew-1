@@ -13,6 +13,14 @@ on:
         options:
           - 'false'
           - 'true'
+      record:
+        description: '录屏（默认关）'
+        required: false
+        default: 'true'
+        type: choice
+        options:
+          - 'true'
+          - 'false'
 
 concurrency:
   group: openworld-renew
@@ -22,7 +30,7 @@ jobs:
   renew:
     name: Renew captcha
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 40
 
     steps:
       - name: Checkout
@@ -34,6 +42,15 @@ jobs:
           python-version: '3.11'
           cache: 'pip'
           cache-dependency-path: requirements.txt
+
+      - name: Install system deps (xvfb + ffmpeg + fonts)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            xvfb x11-utils ffmpeg fonts-noto-cjk \
+            libnss3 libatk1.0-0 libatk-bridge2.0-0 libcups2 \
+            libdrm2 libxkbcommon0 libxcomposite1 libxdamage1 \
+            libxfixes3 libxrandr2 libgbm1 libasound2t64
 
       - name: Install Python deps
         run: |
@@ -60,7 +77,6 @@ jobs:
             exit 0
           fi
 
-          # -------- 1. 下载 sing-box --------
           ARCH="$(uname -m)"
           case "$ARCH" in
             x86_64|amd64)  SB_ARCH="amd64" ;;
@@ -84,7 +100,6 @@ jobs:
           rm -rf sing-box.tar.gz "$SING_BOX_DIR"
           sing-box version
 
-          # -------- 2. 生成配置（1.10.x 兼容）--------
           python3 - << 'PYEOF'
           import json, os, re, base64, sys
           import urllib.request
@@ -161,11 +176,10 @@ jobs:
 
           def parse_vless(uri):
               u = urlparse(uri); q = parse_qs(u.query)
-              uuid = u.username or ''
               host, port = _split_hostport(u.netloc.split('@', 1)[-1])
               ob = {'type': 'vless', 'tag': 'proxy',
                     'server': host, 'server_port': port,
-                    'uuid': uuid, 'packet_encoding': 'xudp'}
+                    'uuid': u.username or '', 'packet_encoding': 'xudp'}
               if q.get('flow', [''])[0]: ob['flow'] = q['flow'][0]
               tls = _tls_obj(q, host)
               if tls: ob['tls'] = tls
@@ -182,8 +196,7 @@ jobs:
               tls = (d.get('tls') or '').lower()
               ob = {'type': 'vmess', 'tag': 'proxy',
                     'server': host, 'server_port': port,
-                    'uuid': d.get('id'),
-                    'security': d.get('scy') or 'auto',
+                    'uuid': d.get('id'), 'security': d.get('scy') or 'auto',
                     'alter_id': int(d.get('aid', 0) or 0)}
               if tls == 'tls':
                   ob['tls'] = {'enabled': True,
@@ -238,19 +251,16 @@ jobs:
                   if uri.startswith(p): return fn(uri)
               return None
 
-          # --- 主流程 ---
           log('下载订阅...')
           try:
               text = fetch(NODE_LINK)
           except Exception as e:
-              log(f'❌ 下载失败: {e}')
-              sys.exit(1)
+              log(f'❌ 下载失败: {e}'); sys.exit(1)
 
           uris = extract_uris(text)
           log(f'提取到 {len(uris)} 个 URI')
           if not uris:
-              log('❌ 没有解析到任何节点')
-              sys.exit(1)
+              log('❌ 没有解析到任何节点'); sys.exit(1)
 
           proxies = []
           for i, uri in enumerate(uris):
@@ -263,32 +273,23 @@ jobs:
                   log(f'  #{i} 解析失败: {e}')
 
           if not proxies:
-              log('❌ 所有节点解析失败')
-              sys.exit(1)
+              log('❌ 所有节点解析失败'); sys.exit(1)
 
           proxy = proxies[0]
           proxy['tag'] = 'proxy'
           log(f'使用节点: {proxy["type"]} {proxy["server"]}:{proxy["server_port"]}')
 
-          # ⭐ sing-box 1.10.x 兼容路由：不用 action 字段
           config = {
               'log': {'level': 'warn', 'timestamp': True},
               'inbounds': [
                   {'type': 'socks', 'tag': 'socks-in',
-                   'listen': '127.0.0.1', 'listen_port': 1080,
-                   'sniff': True},
+                   'listen': '127.0.0.1', 'listen_port': 1080, 'sniff': True},
                   {'type': 'http',  'tag': 'http-in',
-                   'listen': '127.0.0.1', 'listen_port': 1081,
-                   'sniff': True},
+                   'listen': '127.0.0.1', 'listen_port': 1081, 'sniff': True},
               ],
-              'outbounds': [
-                  proxy,
-                  {'type': 'direct', 'tag': 'direct'},
-              ],
+              'outbounds': [proxy, {'type': 'direct', 'tag': 'direct'}],
               'route': {
-                  'rules': [
-                      {'ip_is_private': True, 'outbound': 'direct'},
-                  ],
+                  'rules': [{'ip_is_private': True, 'outbound': 'direct'}],
                   'final': 'proxy',
               },
           }
@@ -297,7 +298,6 @@ jobs:
           log(f'✅ 配置已写入 {CONFIG_OUT}')
           PYEOF
 
-          # -------- 3. 写 output --------
           if [ -f sing-box-config.json ]; then
             echo "proxy_ready=true" >> "$GITHUB_OUTPUT"
           else
@@ -313,7 +313,7 @@ jobs:
           sleep 5
           if ss -tuln 2>/dev/null | grep -q ':1080' && \
              ss -tuln 2>/dev/null | grep -q ':1081'; then
-            echo "::notice::sing-box 已启动 (socks5 127.0.0.1:1080 / http 127.0.0.1:1081)"
+            echo "::notice::sing-box 已启动"
             {
               echo "HTTPS_PROXY=http://127.0.0.1:1081"
               echo "HTTP_PROXY=http://127.0.0.1:1081"
@@ -321,36 +321,46 @@ jobs:
               echo "NO_PROXY=127.0.0.1,localhost"
             } >> "$GITHUB_ENV"
           else
-            echo "::warning::sing-box 未监听预期端口，将直连运行"
-            echo "----- sing-box.log -----"
+            echo "::warning::sing-box 未监听"
             cat sing-box.log || true
-            echo "proxy_ready=false" >> "$GITHUB_OUTPUT"
-            exit 1
           fi
 
-      # ============================================================
-      # ⭐ 出口 IP 检测（直连 vs 代理）
-      # ============================================================
       - name: Check egress IP
         if: steps.singbox.outputs.proxy_ready == 'true'
         run: |
-          echo "========== 直连出口 IP =========="
-          curl -s --noproxy '*' --max-time 10 https://api.ipify.org && echo "" || echo "(直连失败)"
-          echo ""
-          echo "========== 代理出口 IP =========="
-          curl -s -x http://127.0.0.1:1081 --max-time 20 https://api.ipify.org && echo "" || echo "(代理失败)"
-          echo ""
-          echo "========== 代理归属详情 =========="
-          curl -s -x http://127.0.0.1:1081 --max-time 20 https://ipinfo.io/json || echo "(查询失败)"
-          echo ""
-          echo "========== 通过代理访问目标站 =========="
-          curl -s -x http://127.0.0.1:1081 --max-time 20 -o /dev/null -w "HTTP %{http_code}, %{time_total}s\n" \
-            https://openworld.eu.org/ || echo "(目标站访问失败)"
+          echo "=== 直连 ==="
+          curl -s --noproxy '*' --max-time 10 https://api.ipify.org && echo "" || true
+          echo "=== 代理 ==="
+          curl -s -x http://127.0.0.1:1081 --max-time 20 https://api.ipify.org && echo "" || true
+          curl -s -x http://127.0.0.1:1081 --max-time 20 https://ipinfo.io/json || true
 
       # ============================================================
-      # 主任务
+      # ⭐ 有头模式 + 虚拟显示
       # ============================================================
-      - name: Run renew
+      - name: Start virtual display (Xvfb)
+        run: |
+          Xvfb :99 -screen 0 1366x900x24 -ac +extension RANDR &
+          echo $! > xvfb.pid
+          echo "DISPLAY=:99" >> "$GITHUB_ENV"
+          sleep 2
+          DISPLAY=:99 xdpyinfo | head -5 || true
+
+      - name: Start screen recording (ffmpeg)
+        if: ${{ github.event.inputs.record != 'false' }}
+        run: |
+          mkdir -p screenshots
+          nohup ffmpeg -y -f x11grab -video_size 1366x900 \
+            -framerate 10 -i :99 \
+            -codec:v libx264 -preset ultrafast -pix_fmt yuv420p \
+            screenshots/session.mp4 > ffmpeg.log 2>&1 &
+          echo $! > ffmpeg.pid
+          sleep 2
+          ps -p "$(cat ffmpeg.pid)" > /dev/null && echo "ffmpeg 已启动" || cat ffmpeg.log
+
+      # ============================================================
+      # 主任务：有头模式（HEADLESS=false），在 :99 上跑
+      # ============================================================
+      - name: Run renew (headed, xvfb)
         id: renew
         env:
           DISCORD_TOKEN:        ${{ secrets.DISCORD_TOKEN }}
@@ -358,18 +368,36 @@ jobs:
           TG_BOT_TOKEN:         ${{ secrets.TG_BOT_TOKEN }}
           TG_CHAT_ID:           ${{ secrets.TG_CHAT_ID }}
           ACCOUNT_NAME:         ${{ secrets.ACCOUNT_NAME }}
-          HEADLESS:             "true"
+          HEADLESS:             "false"       # ⭐ 有头
           RENEW_THRESHOLD_DAYS: "5"
           FORCE:                ${{ github.event.inputs.force || 'false' }}
-        run: python apprenew.py
+          DISPLAY:              ":99"
+        run: xvfb-run -a --server-num=99 python apprenew.py
+        # 说明：xvfb-run -a 会复用/分配 :99；DISPLAY 环境变量也已注入
 
-      # ---------- 产物上传 ----------
-      - name: Upload screenshots
+      # ============================================================
+      # 停止录像 / 收尾
+      # ============================================================
+      - name: Stop screen recording
+        if: always()
+        run: |
+          if [ -f ffmpeg.pid ]; then
+            kill "$(cat ffmpeg.pid)" 2>/dev/null || true
+            sleep 2
+            ls -la screenshots/ || true
+          fi
+
+      # ============================================================
+      # 产物
+      # ============================================================
+      - name: Upload screenshots & recording
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: screenshots-${{ github.run_number }}
-          path: screenshots/
+          path: |
+            screenshots/
+            ffmpeg.log
           retention-days: 7
           if-no-files-found: ignore
 
@@ -384,9 +412,8 @@ jobs:
           retention-days: 3
           if-no-files-found: ignore
 
-      - name: Stop sing-box
-        if: always() && steps.singbox.outputs.proxy_ready == 'true'
+      - name: Stop sing-box & xvfb
+        if: always()
         run: |
-          if [ -f sing-box.pid ]; then
-            kill "$(cat sing-box.pid)" 2>/dev/null || true
-          fi
+          [ -f sing-box.pid ] && kill "$(cat sing-box.pid)" 2>/dev/null || true
+          [ -f xvfb.pid ]     && kill "$(cat xvfb.pid)"     2>/dev/null || true
