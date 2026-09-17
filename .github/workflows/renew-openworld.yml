@@ -44,7 +44,7 @@ jobs:
         run: python -m playwright install --with-deps chromium
 
       # ============================================================
-      # 可选：sing-box 代理（全部内联，不依赖额外文件）
+      # 可选：sing-box 代理
       # ============================================================
       - name: Setup sing-box proxy
         id: singbox
@@ -84,7 +84,7 @@ jobs:
           rm -rf sing-box.tar.gz "$SING_BOX_DIR"
           sing-box version
 
-          # -------- 2. 生成配置 --------
+          # -------- 2. 生成配置（1.10.x 兼容）--------
           python3 - << 'PYEOF'
           import json, os, re, base64, sys
           import urllib.request
@@ -104,7 +104,8 @@ jobs:
               return link
 
           def try_b64(text):
-              s = re.sub(r'\s+', '', text) + '=' * (-len(re.sub(r'\s+', '', text)) % 4)
+              s = re.sub(r'\s+', '', text)
+              s += '=' * (-len(s) % 4)
               try:
                   dec = base64.b64decode(s, validate=True).decode(errors='ignore')
                   if '://' in dec: return dec
@@ -118,8 +119,7 @@ jobs:
                   if d:
                       log('base64 订阅已解码')
                       text = d
-              return re.findall(r'(vless|vmess|trojan|ss)://\S+', text) and \
-                     re.findall(r'(?:vless|vmess|trojan|ss)://\S+', text) or []
+              return re.findall(r'(?:vless|vmess|trojan|ss)://\S+', text)
 
           def _split_hostport(hp):
               bm = re.match(r'^\[([^\]]+)\](?::(\d+))?$', hp)
@@ -218,7 +218,7 @@ jobs:
                       userinfo = base64.b64decode(
                           userinfo + '=' * (-len(userinfo) % 4)).decode()
                   except Exception:
-                      userinfo = userinfo
+                      pass
                   method, password = userinfo.split(':', 1)
                   host, port = _split_hostport(hostport)
               else:
@@ -270,19 +270,23 @@ jobs:
           proxy['tag'] = 'proxy'
           log(f'使用节点: {proxy["type"]} {proxy["server"]}:{proxy["server_port"]}')
 
+          # ⭐ sing-box 1.10.x 兼容路由：不用 action 字段
           config = {
               'log': {'level': 'warn', 'timestamp': True},
               'inbounds': [
                   {'type': 'socks', 'tag': 'socks-in',
-                   'listen': '127.0.0.1', 'listen_port': 1080},
+                   'listen': '127.0.0.1', 'listen_port': 1080,
+                   'sniff': True},
                   {'type': 'http',  'tag': 'http-in',
-                   'listen': '127.0.0.1', 'listen_port': 1081},
+                   'listen': '127.0.0.1', 'listen_port': 1081,
+                   'sniff': True},
               ],
-              'outbounds': [proxy, {'type': 'direct', 'tag': 'direct'}],
+              'outbounds': [
+                  proxy,
+                  {'type': 'direct', 'tag': 'direct'},
+              ],
               'route': {
                   'rules': [
-                      {'action': 'sniff'},
-                      {'protocol': 'dns', 'action': 'hijack-dns'},
                       {'ip_is_private': True, 'outbound': 'direct'},
                   ],
                   'final': 'proxy',
@@ -306,7 +310,7 @@ jobs:
           set -e
           nohup sing-box run -c sing-box-config.json > sing-box.log 2>&1 &
           echo $! > sing-box.pid
-          sleep 4
+          sleep 5
           if ss -tuln 2>/dev/null | grep -q ':1080' && \
              ss -tuln 2>/dev/null | grep -q ':1081'; then
             echo "::notice::sing-box 已启动 (socks5 127.0.0.1:1080 / http 127.0.0.1:1081)"
@@ -320,7 +324,28 @@ jobs:
             echo "::warning::sing-box 未监听预期端口，将直连运行"
             echo "----- sing-box.log -----"
             cat sing-box.log || true
+            echo "proxy_ready=false" >> "$GITHUB_OUTPUT"
+            exit 1
           fi
+
+      # ============================================================
+      # ⭐ 出口 IP 检测（直连 vs 代理）
+      # ============================================================
+      - name: Check egress IP
+        if: steps.singbox.outputs.proxy_ready == 'true'
+        run: |
+          echo "========== 直连出口 IP =========="
+          curl -s --noproxy '*' --max-time 10 https://api.ipify.org && echo "" || echo "(直连失败)"
+          echo ""
+          echo "========== 代理出口 IP =========="
+          curl -s -x http://127.0.0.1:1081 --max-time 20 https://api.ipify.org && echo "" || echo "(代理失败)"
+          echo ""
+          echo "========== 代理归属详情 =========="
+          curl -s -x http://127.0.0.1:1081 --max-time 20 https://ipinfo.io/json || echo "(查询失败)"
+          echo ""
+          echo "========== 通过代理访问目标站 =========="
+          curl -s -x http://127.0.0.1:1081 --max-time 20 -o /dev/null -w "HTTP %{http_code}, %{time_total}s\n" \
+            https://openworld.eu.org/ || echo "(目标站访问失败)"
 
       # ============================================================
       # 主任务
