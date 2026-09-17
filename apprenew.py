@@ -1,18 +1,24 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-# apprenew.py — Openworld VPS 自动续期（GitHub Actions + sing-box 代理）
+# apprenew.py — Openworld VPS 自动续期
+#   - patchright 反检测
+#   - 有头模式 (Xvfb)
+#   - CDP 发鼠标事件（精确时序）
+#   - 滑块初始位置检测
 
 import os
 import re
 import sys
 import json
 import random
+import time as _time
 import urllib.parse
 import requests
-import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from playwright.sync_api import sync_playwright
+
+# ⭐ 用 patchright 替代 playwright
+from patchright.sync_api import sync_playwright
 
 try:
     import numpy as np
@@ -26,15 +32,14 @@ except ImportError:
 # 环境变量
 # ============================================================
 DISCORD_TOKEN    = os.environ.get("DISCORD_TOKEN", "").strip()
-DISCORD_GUILD_ID = os.environ.get("DISCORD_GUILD_ID", "").strip()   # ⭐ 空就是空
+DISCORD_GUILD_ID = os.environ.get("DISCORD_GUILD_ID", "").strip()
 TG_BOT_TOKEN     = os.environ.get("TG_BOT_TOKEN", "").strip()
 TG_CHAT_ID       = os.environ.get("TG_CHAT_ID", "").strip()
 ACCOUNT_NAME     = os.environ.get("ACCOUNT_NAME", "Openworld")
 SITE_BASE        = os.environ.get("SITE_BASE", "https://openworld.eu.org")
-HEADLESS         = os.environ.get("HEADLESS", "true").lower() == "true"
+HEADLESS         = os.environ.get("HEADLESS", "false").lower() == "true"
 RENEW_THRESHOLD_DAYS = int(os.environ.get("RENEW_THRESHOLD_DAYS", "5"))
 
-# ⭐ 代理
 PROXY_URL = (os.environ.get("HTTPS_PROXY")
              or os.environ.get("HTTP_PROXY")
              or os.environ.get("ALL_PROXY")
@@ -190,14 +195,14 @@ def dump_page_debug(page, name):
 def wait_for_cloudflare(page, timeout=15):
     inds = ["verify you are human", "just a moment", "checking your browser",
             "cf-browser-verification", "challenge-platform"]
-    start = time.time()
-    while time.time() - start < timeout:
+    start = _time.time()
+    while _time.time() - start < timeout:
         try:
             if not any(i in page.content().lower() for i in inds):
                 return True
         except Exception:
             pass
-        time.sleep(1)
+        _time.sleep(1)
     return False
 
 
@@ -295,7 +300,6 @@ def login_with_discord_token(page, dc_token: str) -> bool:
         "redirect_uri": redirect_uri, "scope": scope, "state": state,
     })
 
-    # ⭐ 按需拼装 payload：guild_id 为空就不带，避免 Discord 400
     auth_payload = {
         "permissions": "0",
         "authorize": True,
@@ -709,7 +713,36 @@ def _solve_match(bg_bytes, meta):
     return match_map[0] * 100 + match_map[1] * 10 + match_map[2]
 
 
-# ================= 交互 =================
+# ================= 交互（CDP 直发鼠标事件）=================
+
+def _cdp(page):
+    """拿一个 CDP session（每次新建，避免 stale）"""
+    return page.context.new_cdp_session(page)
+
+
+def _cdp_move(session, x, y, buttons=0):
+    session.send("Input.dispatchMouseEvent", {
+        "type": "mouseMoved",
+        "x": float(x), "y": float(y),
+        "button": "none", "buttons": buttons, "clickCount": 0,
+    })
+
+
+def _cdp_down(session, x, y):
+    session.send("Input.dispatchMouseEvent", {
+        "type": "mousePressed",
+        "x": float(x), "y": float(y),
+        "button": "left", "buttons": 1, "clickCount": 1,
+    })
+
+
+def _cdp_up(session, x, y):
+    session.send("Input.dispatchMouseEvent", {
+        "type": "mouseReleased",
+        "x": float(x), "y": float(y),
+        "button": "left", "buttons": 0, "clickCount": 1,
+    })
+
 
 def _box_pos_to_page(page, x, y):
     box = page.locator("#captcha_box_default")
@@ -724,39 +757,48 @@ def _box_pos_to_page(page, x, y):
     return px, py
 
 
-def _hover_to(page, tx, ty, steps=None):
-    if steps is None:
-        steps = random.randint(14, 24)
-    cur = page.evaluate(
-        "() => [window.__owMouseX || window.innerWidth / 2, "
-        "window.__owMouseY || window.innerHeight / 2]")
-    cx, cy = cur[0], cur[1]
+def _human_move(session, cx, cy, tx, ty, total_s=None):
+    """从 (cx,cy) 自然移动到 (tx,ty)，用 CDP 发事件，用 perf_counter 精确控制时序。"""
+    if total_s is None:
+        total_s = random.uniform(0.35, 0.7)
+    steps = random.randint(18, 28)
+
+    def ease(t):
+        # 加速 → 减速
+        return t * t * (3 - 2 * t)
+
+    t0 = _time.perf_counter()
     for i in range(1, steps + 1):
         t = i / steps
-        eased = 1 - (1 - t) ** 2
-        x = cx + (tx - cx) * eased + random.uniform(-1.5, 1.5)
-        y = cy + (ty - cy) * eased + random.uniform(-1.5, 1.5)
-        page.mouse.move(x, y)
-        page.wait_for_timeout(random.randint(18, 38))
-        page.evaluate("([x, y]) => { window.__owMouseX = x; window.__owMouseY = y; }",
-                      [x, y])
-    page.mouse.move(tx + random.uniform(-0.5, 0.5), ty + random.uniform(-0.5, 0.5))
-    page.wait_for_timeout(random.randint(60, 150))
+        target_t = t0 + total_s * t
+        now = _time.perf_counter()
+        if target_t > now:
+            _time.sleep(target_t - now)
+        x = cx + (tx - cx) * ease(t) + random.gauss(0, 1.0)
+        y = cy + (ty - cy) * ease(t) + random.gauss(0, 1.0)
+        _cdp_move(session, x, y)
+    _cdp_move(session, tx, ty)
 
 
 def _click_captcha_point(page, x, y):
     px, py = _box_pos_to_page(page, x, y)
     box = page.locator("#captcha_box_default")
     bb = box.bounding_box()
+
+    s = _cdp(page)
+    # 起手：先随便 hover 一下
     hx = bb["x"] + bb["width"] * random.uniform(0.2, 0.8)
     hy = bb["y"] + bb["height"] * random.uniform(0.2, 0.8)
-    page.mouse.move(hx, hy)
-    page.wait_for_timeout(random.randint(120, 260))
-    _hover_to(page, px, py)
-    page.mouse.down()
-    page.wait_for_timeout(random.randint(40, 90))
-    page.mouse.up()
-    page.wait_for_timeout(random.randint(200, 400))
+    _cdp_move(s, hx, hy)
+    _time.sleep(random.uniform(0.12, 0.26))
+
+    # 移到目标
+    _human_move(s, hx, hy, px, py, total_s=random.uniform(0.4, 0.8))
+    _time.sleep(random.uniform(0.05, 0.12))
+    _cdp_down(s, px, py)
+    _time.sleep(random.uniform(0.04, 0.09))
+    _cdp_up(s, px, py)
+    _time.sleep(random.uniform(0.2, 0.4))
 
 
 def _click_match_pairs(page, meta):
@@ -766,24 +808,21 @@ def _click_match_pairs(page, meta):
         raise RuntimeError("match left/right 需各 3 个")
 
     match_map = _match_map_for_click(page, meta)
+    s = _cdp(page)
+    last_x, last_y = 400, 300  # 从任意位置开始
 
     for i in range(3):
-        li = left[i]
-        px, py = _box_pos_to_page(page, li["x"], li["y"])
-        _hover_to(page, px, py)
-        page.mouse.down()
-        page.wait_for_timeout(random.randint(30, 70))
-        page.mouse.up()
-        page.wait_for_timeout(random.randint(250, 450))
-
-        rj = right[match_map[i]]
-        px, py = _box_pos_to_page(page, rj["x"], rj["y"])
-        _hover_to(page, px, py)
-        page.mouse.down()
-        page.wait_for_timeout(random.randint(30, 70))
-        page.mouse.up()
-        page.wait_for_timeout(random.randint(250, 450))
-    page.wait_for_timeout(500)
+        for it in (left[i], right[match_map[i]]):
+            px, py = _box_pos_to_page(page, it["x"], it["y"])
+            _human_move(s, last_x, last_y, px, py,
+                        total_s=random.uniform(0.35, 0.7))
+            _time.sleep(random.uniform(0.04, 0.1))
+            _cdp_down(s, px, py)
+            _time.sleep(random.uniform(0.03, 0.07))
+            _cdp_up(s, px, py)
+            _time.sleep(random.uniform(0.25, 0.45))
+            last_x, last_y = px, py
+    _time.sleep(0.5)
 
 
 def _match_map_for_click(page, meta):
@@ -837,44 +876,109 @@ def _match_map_calc(bg_bytes, meta):
 
 
 def _drag_slider(page, value, vmax):
+    """
+    拖动滑块。
+    ⭐ 关键：先读 handle 的真实初始位置（可能不在最左），再计算相对位移。
+    """
     track = page.locator("#captcha_track_default")
     track.wait_for(state="visible", timeout=5000)
     box = track.bounding_box()
     if not box:
         raise RuntimeError("track 不可见")
 
-    hw = page.evaluate("""() => {
+    # === 读真实初始状态 ===
+    probe = page.evaluate("""() => {
+        const out = {};
         const h = document.getElementById('captcha_handle_default');
-        return h ? h.offsetWidth : 24;
-    }""") or 24
+        if (h) {
+            out.handle_style_left = h.style.left || '';
+            out.handle_rect = (() => {
+                const r = h.getBoundingClientRect();
+                return {x: r.x, y: r.y, w: r.width, h: r.height};
+            })();
+        }
+        const t = document.getElementById('captcha_track_default');
+        if (t) {
+            const r = t.getBoundingClientRect();
+            out.track_rect = {x: r.x, y: r.y, w: r.width, h: r.height};
+        }
+        out.inputs = [];
+        document.querySelectorAll('input').forEach((el, i) => {
+            out.inputs.push({i, type: el.type, name: el.name, id: el.id,
+                             value: el.value, min: el.min, max: el.max});
+        });
+        return out;
+    }""")
+    print(f"   🔬 滑块初始: style.left={probe.get('handle_style_left')!r} "
+          f"handle_rect={probe.get('handle_rect')} "
+          f"track_rect={probe.get('track_rect')}")
+    if probe.get("inputs"):
+        print(f"      inputs={probe['inputs']}")
 
-    frac = max(0.0, min(1.0, value / max(1, vmax)))
-    usable = max(1.0, box["width"] - hw)
-    target_x = box["x"] + hw / 2 + frac * usable
-    start_x = box["x"] + hw / 2
+    h_r = probe.get("handle_rect") or {}
+    t_r = probe.get("track_rect") or {}
+    hw = h_r.get("w", 24) or 24
+
+    # 推算 handle 当前的 value 分数
+    usable = max(1.0, (t_r.get("w", box["width"]) - hw))
+    handle_x = h_r.get("x", box["x"])
+    track_x = t_r.get("x", box["x"])
+    start_frac = max(0.0, min(1.0, (handle_x - track_x) / usable))
+    start_value = start_frac * vmax
+    print(f"      📐 推算 start_value ≈ {start_value:.1f}/{vmax} "
+          f"(handle.x={handle_x:.1f}, track.x={track_x:.1f}, usable={usable:.1f})")
+
+    # 目标位置：value 对应的 handle.x
+    target_frac = max(0.0, min(1.0, value / max(1, vmax)))
+    target_x = box["x"] + hw / 2 + target_frac * usable
+    start_x  = handle_x + hw / 2
     y = box["y"] + box["height"] / 2
 
-    page.mouse.move(start_x, y)
-    page.wait_for_timeout(random.randint(80, 200))
-    page.mouse.down()
-    page.wait_for_timeout(random.randint(60, 120))
+    # === 用 CDP 发事件，精确时序 ===
+    s = _cdp(page)
 
+    # 先把鼠标挪到 handle 上
+    _human_move(s, start_x - random.uniform(80, 200), y - random.uniform(30, 80),
+                start_x, y, total_s=random.uniform(0.3, 0.5))
+    _time.sleep(random.uniform(0.1, 0.2))
+    _cdp_down(s, start_x, y)
+
+    # 拖动：总时长 1.0~1.6s，30~45 步
+    total_s = random.uniform(1.0, 1.6)
     steps = random.randint(30, 45)
+
+    def ease(t):
+        # 加速-匀速-减速，尾段慢
+        if t < 0.15:
+            return (t / 0.15) ** 2 * 0.12
+        if t < 0.80:
+            return 0.12 + (t - 0.15) / 0.65 * 0.68
+        u = (t - 0.80) / 0.20
+        return 0.80 + (1 - (1 - u) ** 2) * 0.20
+
+    t0 = _time.perf_counter()
     for i in range(1, steps + 1):
         t = i / steps
-        eased = 1 - (1 - t) ** 2
-        x = start_x + (target_x - start_x) * eased
-        page.mouse.move(x, y + random.uniform(-1.5, 1.5))
-        page.wait_for_timeout(random.randint(18, 35))
+        target_t = t0 + total_s * t
+        now = _time.perf_counter()
+        if target_t > now:
+            _time.sleep(target_t - now)
 
+        x = start_x + (target_x - start_x) * ease(t)
+        yj = random.gauss(0, 1.2)
+        _cdp_move(s, x, y + yj, buttons=1)
+
+    # 过冲回拉
+    _time.sleep(random.uniform(0.05, 0.1))
     over = random.uniform(3, 6)
-    page.mouse.move(target_x + over, y + random.uniform(-2, 2))
-    page.wait_for_timeout(random.randint(50, 90))
-    page.mouse.move(target_x - random.uniform(1, 3), y + random.uniform(-1, 1))
-    page.wait_for_timeout(random.randint(40, 80))
-    page.mouse.move(target_x + random.uniform(-1, 1), y + random.uniform(-1, 1))
-    page.wait_for_timeout(random.randint(30, 60))
-    page.mouse.up()
+    _cdp_move(s, target_x + over, y + random.uniform(-2, 2), buttons=1)
+    _time.sleep(random.uniform(0.05, 0.09))
+    _cdp_move(s, target_x - random.uniform(1, 3), y + random.uniform(-1, 1), buttons=1)
+    _time.sleep(random.uniform(0.04, 0.08))
+    _cdp_move(s, target_x + random.uniform(-1, 1), y + random.uniform(-1, 1), buttons=1)
+    _time.sleep(random.uniform(0.03, 0.06))
+
+    _cdp_up(s, target_x, y)
 
 
 # ================= 一关处理 =================
@@ -979,11 +1083,11 @@ def _try_renew_session(page, attempt, initial_days):
     handled_fps = set()
     switch_count = 0
     fail_count = 0
-    last_action = time.time()
-    start = time.time()
+    last_action = _time.time()
+    start = _time.time()
     max_total = 300
 
-    while time.time() - start < max_total:
+    while _time.time() - start < max_total:
         if WS_STATE.get("closed"):
             print("   ⚠️ WS 已关闭，退出会话")
             return None
@@ -1055,7 +1159,7 @@ def _try_renew_session(page, attempt, initial_days):
         fp = (meta["id"], meta.get("stage"), meta.get("nf"))
         if fp in handled_fps:
             page.wait_for_timeout(300)
-            if time.time() - last_action > 60:
+            if _time.time() - last_action > 60:
                 print("   ⚠️ 60s 无新状态，退出")
                 return None
             continue
@@ -1067,7 +1171,7 @@ def _try_renew_session(page, attempt, initial_days):
 
         frames = list(WS_STATE["frames"])[:nf]
         handled_fps.add(fp)
-        last_action = time.time()
+        last_action = _time.time()
 
         tag = f"a{attempt}_{meta['id'][:6]}"
         for i, fb in enumerate(frames):
@@ -1178,7 +1282,7 @@ def check_config():
     print("⚙️  配置检查")
     print("=" * 50)
     print(f"   DISCORD_TOKEN : {'✅ 已设置' if DISCORD_TOKEN else '❌ 空'}")
-    print(f"   GUILD_ID      : {DISCORD_GUILD_ID if DISCORD_GUILD_ID else '⚪ 空（OAuth 会省略该字段）'}")
+    print(f"   GUILD_ID      : {DISCORD_GUILD_ID if DISCORD_GUILD_ID else '⚪ 空'}")
     print(f"   TG 通知       : {'✅ 已启用' if (TG_BOT_TOKEN and TG_CHAT_ID) else '⚪ 未启用'}")
     print(f"   SITE_BASE     : {SITE_BASE}")
     print(f"   模式          : {'无头' if HEADLESS else '有头'}")
@@ -1191,7 +1295,7 @@ def check_config():
 
 def main():
     print("#" * 60)
-    print("   Openworld VPS 自动续期 (apprenew + sing-box)")
+    print("   Openworld VPS 自动续期 (patchright + headed + CDP)")
     print("#" * 60)
 
     if not check_config():
@@ -1206,18 +1310,19 @@ def main():
                 "--no-sandbox",
                 "--disable-dev-shm-usage",
                 "--disable-features=IsolateOrigins,site-per-process",
+                "--disable-gpu-sandbox",
             ],
         }
         if PROXY_URL:
             launch_kwargs["proxy"] = {"server": PROXY_URL}
-            print(f"🌐 Playwright 走代理: {PROXY_URL}")
+            print(f"🌐 走代理: {PROXY_URL}")
 
         browser = p.chromium.launch(**launch_kwargs)
         ctx = browser.new_context(
             user_agent=("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
                         "AppleWebKit/537.36 (KHTML, like Gecko) "
                         "Chrome/130.0.0.0 Safari/537.36"),
-            viewport={"width": 1280, "height": 720},
+            viewport={"width": 1366, "height": 800},
             locale="en-US",
             timezone_id="America/New_York",
         )
