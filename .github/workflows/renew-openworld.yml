@@ -43,7 +43,7 @@ jobs:
           ACCOUNT_NAME:     ${{ secrets.ACCOUNT_NAME }}
           HEADLESS:         "true"
           RENEW_THRESHOLD_DAYS: "5"
-        run: python main.py
+        run: python apprenew.py
 
       - name: Upload screenshots
         if: always()
