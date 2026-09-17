@@ -6,7 +6,7 @@
 
 ### 1. Fork 或新建仓库
 
-把 `apprenew.py`、`requirements.txt`、`.github/workflows/renew.yml` 放进去。
+把 `apprenew.py`、`requirements.txt`、`.github/workflows/renew-openworld.yml` 放进去。
 
 ### 2. 配置 Secrets
 
