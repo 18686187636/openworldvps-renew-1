@@ -14,7 +14,7 @@ on:
           - 'false'
           - 'true'
       record:
-        description: '录屏（默认关）'
+        description: '录屏'
         required: false
         default: 'true'
         type: choice
@@ -57,11 +57,14 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Install Playwright browsers
-        run: python -m playwright install --with-deps chromium
+      - name: Install browsers (patchright + playwright)
+        run: |
+          python -m patchright install --with-deps chromium || \
+            python -m patchright install chromium
+          python -m playwright install --with-deps chromium || true
 
       # ============================================================
-      # 可选：sing-box 代理
+      # sing-box 代理（可选）
       # ============================================================
       - name: Setup sing-box proxy
         id: singbox
@@ -335,11 +338,11 @@ jobs:
           curl -s -x http://127.0.0.1:1081 --max-time 20 https://ipinfo.io/json || true
 
       # ============================================================
-      # ⭐ 有头模式 + 虚拟显示
+      # 虚拟显示 + 录屏
       # ============================================================
       - name: Start virtual display (Xvfb)
         run: |
-          Xvfb :99 -screen 0 1366x900x24 -ac +extension RANDR &
+          Xvfb :99 -screen 0 1440x900x24 -ac +extension RANDR &
           echo $! > xvfb.pid
           echo "DISPLAY=:99" >> "$GITHUB_ENV"
           sleep 2
@@ -349,8 +352,8 @@ jobs:
         if: ${{ github.event.inputs.record != 'false' }}
         run: |
           mkdir -p screenshots
-          nohup ffmpeg -y -f x11grab -video_size 1366x900 \
-            -framerate 10 -i :99 \
+          nohup ffmpeg -y -f x11grab -video_size 1440x900 \
+            -framerate 15 -i :99 \
             -codec:v libx264 -preset ultrafast -pix_fmt yuv420p \
             screenshots/session.mp4 > ffmpeg.log 2>&1 &
           echo $! > ffmpeg.pid
@@ -358,9 +361,39 @@ jobs:
           ps -p "$(cat ffmpeg.pid)" > /dev/null && echo "ffmpeg 已启动" || cat ffmpeg.log
 
       # ============================================================
-      # 主任务：有头模式（HEADLESS=false），在 :99 上跑
+      # 指纹 probe（保留，便于诊断）
       # ============================================================
-      - name: Run renew (headed, xvfb)
+      - name: Fingerprint probe
+        env:
+          DISPLAY: ":99"
+        run: |
+          python3 - << 'PYEOF'
+          from patchright.sync_api import sync_playwright
+          with sync_playwright() as p:
+              b = p.chromium.launch(headless=False)
+              pg = b.new_page()
+              fp = pg.evaluate("""() => {
+                  const c = document.createElement('canvas');
+                  const gl = c.getContext('webgl') || c.getContext('experimental-webgl');
+                  const ext = gl && gl.getExtension('WEBGL_debug_renderer_info');
+                  return {
+                      vendor:   gl ? gl.getParameter(ext ? ext.UNMASKED_VENDOR_WEBGL   : gl.VENDOR)   : 'none',
+                      renderer: gl ? gl.getParameter(ext ? ext.UNMASKED_RENDERER_WEBGL : gl.RENDERER) : 'none',
+                      ua: navigator.userAgent,
+                      webdriver: navigator.webdriver,
+                      platform: navigator.platform,
+                      hardwareConcurrency: navigator.hardwareConcurrency,
+                  };
+              }""")
+              import json as _j
+              print(_j.dumps(fp, indent=2, ensure_ascii=False))
+              b.close()
+          PYEOF
+
+      # ============================================================
+      # 主任务
+      # ============================================================
+      - name: Run renew
         id: renew
         env:
           DISCORD_TOKEN:        ${{ secrets.DISCORD_TOKEN }}
@@ -368,16 +401,12 @@ jobs:
           TG_BOT_TOKEN:         ${{ secrets.TG_BOT_TOKEN }}
           TG_CHAT_ID:           ${{ secrets.TG_CHAT_ID }}
           ACCOUNT_NAME:         ${{ secrets.ACCOUNT_NAME }}
-          HEADLESS:             "false"       # ⭐ 有头
+          HEADLESS:             "false"
           RENEW_THRESHOLD_DAYS: "5"
           FORCE:                ${{ github.event.inputs.force || 'false' }}
           DISPLAY:              ":99"
-        run: xvfb-run -a --server-num=99 python apprenew.py
-        # 说明：xvfb-run -a 会复用/分配 :99；DISPLAY 环境变量也已注入
+        run: python apprenew.py
 
-      # ============================================================
-      # 停止录像 / 收尾
-      # ============================================================
       - name: Stop screen recording
         if: always()
         run: |
@@ -387,9 +416,6 @@ jobs:
             ls -la screenshots/ || true
           fi
 
-      # ============================================================
-      # 产物
-      # ============================================================
       - name: Upload screenshots & recording
         if: always()
         uses: actions/upload-artifact@v4
