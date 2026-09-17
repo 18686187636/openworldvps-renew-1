@@ -2,21 +2,32 @@ name: Auto Renew Openworld VPS
 
 on:
   schedule:
-    # 每天 UTC 02:00（北京 10:00）检查一次
+    # 每天 UTC 02:00（北京 10:00）跑一次
     - cron: '0 2 * * *'
   workflow_dispatch:
     inputs:
       force:
-        description: '强制续期（跳过天数检查）'
+        description: '强制续期（忽略天数检查）'
         required: false
         default: 'false'
+        type: choice
+        options:
+          - 'false'
+          - 'true'
+
+# 同一时间只允许一个续期任务，避免并发抢 WS
+concurrency:
+  group: openworld-renew
+  cancel-in-progress: false
 
 jobs:
   renew:
+    name: Renew captcha
     runs-on: ubuntu-latest
     timeout-minutes: 30
 
     steps:
+      # ---------- 环境准备 ----------
       - name: Checkout
         uses: actions/checkout@v4
 
@@ -25,26 +36,62 @@ jobs:
         with:
           python-version: '3.11'
           cache: 'pip'
+          cache-dependency-path: requirements.txt
 
       - name: Install Python deps
         run: |
-          pip install --upgrade pip
+          python -m pip install --upgrade pip
           pip install -r requirements.txt
 
       - name: Install Playwright browsers
         run: python -m playwright install --with-deps chromium
 
-      - name: Run renew
+      # ---------- 可选：sing-box 代理 ----------
+      - name: Setup sing-box proxy
+        id: singbox
         env:
-          DISCORD_TOKEN:    ${{ secrets.DISCORD_TOKEN }}
-          DISCORD_GUILD_ID: ${{ secrets.DISCORD_GUILD_ID }}
-          TG_BOT_TOKEN:     ${{ secrets.TG_BOT_TOKEN }}
-          TG_CHAT_ID:       ${{ secrets.TG_CHAT_ID }}
-          ACCOUNT_NAME:     ${{ secrets.ACCOUNT_NAME }}
-          HEADLESS:         "true"
+          NODE_LINK: ${{ secrets.NODE_LINK }}
+          SING_BOX_VERSION: "1.10.7"
+          SINGBOX_CONFIG: "sing-box-config.json"
+        run: python3 setup_singbox.py
+
+      - name: Start sing-box
+        if: steps.singbox.outputs.proxy_ready == 'true'
+        run: |
+          set -e
+          nohup sing-box run -c sing-box-config.json > sing-box.log 2>&1 &
+          echo $! > sing-box.pid
+          sleep 4
+          if ss -tuln 2>/dev/null | grep -q ':1080' && \
+             ss -tuln 2>/dev/null | grep -q ':1081'; then
+            echo "::notice::sing-box 已启动 (socks5 127.0.0.1:1080 / http 127.0.0.1:1081)"
+            {
+              echo "HTTPS_PROXY=http://127.0.0.1:1081"
+              echo "HTTP_PROXY=http://127.0.0.1:1081"
+              echo "ALL_PROXY=socks5://127.0.0.1:1080"
+              echo "NO_PROXY=127.0.0.1,localhost"
+            } >> "$GITHUB_ENV"
+          else
+            echo "::warning::sing-box 未监听预期端口，将直连运行"
+            echo "----- sing-box.log -----"
+            cat sing-box.log || true
+          fi
+
+      # ---------- 主任务 ----------
+      - name: Run renew
+        id: renew
+        env:
+          DISCORD_TOKEN:        ${{ secrets.DISCORD_TOKEN }}
+          DISCORD_GUILD_ID:     ${{ secrets.DISCORD_GUILD_ID }}
+          TG_BOT_TOKEN:         ${{ secrets.TG_BOT_TOKEN }}
+          TG_CHAT_ID:           ${{ secrets.TG_CHAT_ID }}
+          ACCOUNT_NAME:         ${{ secrets.ACCOUNT_NAME }}
+          HEADLESS:             "true"
           RENEW_THRESHOLD_DAYS: "5"
+          FORCE:                ${{ github.event.inputs.force || 'false' }}
         run: python apprenew.py
 
+      # ---------- 产物上传 ----------
       - name: Upload screenshots
         if: always()
         uses: actions/upload-artifact@v4
@@ -53,3 +100,22 @@ jobs:
           path: screenshots/
           retention-days: 7
           if-no-files-found: ignore
+
+      - name: Upload sing-box log & config
+        if: always() && steps.singbox.outputs.proxy_ready == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: singbox-${{ github.run_number }}
+          path: |
+            sing-box.log
+            sing-box-config.json
+          retention-days: 3
+          if-no-files-found: ignore
+
+      # ---------- 收尾：停 sing-box ----------
+      - name: Stop sing-box
+        if: always() && steps.singbox.outputs.proxy_ready == 'true'
+        run: |
+          if [ -f sing-box.pid ]; then
+            kill "$(cat sing-box.pid)" 2>/dev/null || true
+          fi
