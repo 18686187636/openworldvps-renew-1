@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-# apprenew.py — Openworld VPS 自动续期（GitHub Actions 版 + sing-box 代理）
+# apprenew.py — Openworld VPS 自动续期（GitHub Actions + sing-box 代理）
 
 import os
 import re
@@ -25,17 +25,20 @@ except ImportError:
 # ============================================================
 # 环境变量
 # ============================================================
-DISCORD_TOKEN    = os.environ.get("DISCORD_TOKEN", "")
-DISCORD_GUILD_ID = os.environ.get("DISCORD_GUILD_ID", "1525632757072658502")
-TG_BOT_TOKEN     = os.environ.get("TG_BOT_TOKEN", "")
-TG_CHAT_ID       = os.environ.get("TG_CHAT_ID", "")
+DISCORD_TOKEN    = os.environ.get("DISCORD_TOKEN", "").strip()
+DISCORD_GUILD_ID = os.environ.get("DISCORD_GUILD_ID", "").strip()   # ⭐ 空就是空
+TG_BOT_TOKEN     = os.environ.get("TG_BOT_TOKEN", "").strip()
+TG_CHAT_ID       = os.environ.get("TG_CHAT_ID", "").strip()
 ACCOUNT_NAME     = os.environ.get("ACCOUNT_NAME", "Openworld")
 SITE_BASE        = os.environ.get("SITE_BASE", "https://openworld.eu.org")
 HEADLESS         = os.environ.get("HEADLESS", "true").lower() == "true"
 RENEW_THRESHOLD_DAYS = int(os.environ.get("RENEW_THRESHOLD_DAYS", "5"))
 
 # ⭐ 代理
-PROXY_URL = os.environ.get("HTTPS_PROXY") or os.environ.get("ALL_PROXY") or ""
+PROXY_URL = (os.environ.get("HTTPS_PROXY")
+             or os.environ.get("HTTP_PROXY")
+             or os.environ.get("ALL_PROXY")
+             or "").strip()
 
 SCREENSHOT_DIR = os.environ.get("SCREENSHOT_DIR", "./screenshots")
 os.makedirs(SCREENSHOT_DIR, exist_ok=True)
@@ -291,6 +294,24 @@ def login_with_discord_token(page, dc_token: str) -> bool:
         "client_id": client_id, "response_type": response_type,
         "redirect_uri": redirect_uri, "scope": scope, "state": state,
     })
+
+    # ⭐ 按需拼装 payload：guild_id 为空就不带，避免 Discord 400
+    auth_payload = {
+        "permissions": "0",
+        "authorize": True,
+        "integration_type": 0,
+    }
+    if DISCORD_GUILD_ID:
+        auth_payload["guild_id"] = DISCORD_GUILD_ID
+        auth_payload["location_context"] = {
+            "guild_id": DISCORD_GUILD_ID,
+            "channel_id": "10000",
+            "channel_type": 10000,
+        }
+        print(f"   使用 guild_id: {DISCORD_GUILD_ID}")
+    else:
+        print("   guild_id 为空，不携带（Discord OAuth 允许）")
+
     try:
         r = requests.post(
             f"https://discord.com/api/v9/oauth2/authorize?{api_p}",
@@ -304,12 +325,7 @@ def login_with_discord_token(page, dc_token: str) -> bool:
                                "AppleWebKit/537.36 (KHTML, like Gecko) "
                                "Chrome/130.0.0.0 Safari/537.36"),
             },
-            json={
-                "guild_id": DISCORD_GUILD_ID,
-                "permissions": "0", "authorize": True, "integration_type": 0,
-                "location_context": {"guild_id": "10000", "channel_id": "10000",
-                                     "channel_type": 10000},
-            },
+            json=auth_payload,
             timeout=20,
         )
         print(f"   API: {r.status_code}")
@@ -1162,7 +1178,7 @@ def check_config():
     print("⚙️  配置检查")
     print("=" * 50)
     print(f"   DISCORD_TOKEN : {'✅ 已设置' if DISCORD_TOKEN else '❌ 空'}")
-    print(f"   GUILD_ID      : {DISCORD_GUILD_ID}")
+    print(f"   GUILD_ID      : {DISCORD_GUILD_ID if DISCORD_GUILD_ID else '⚪ 空（OAuth 会省略该字段）'}")
     print(f"   TG 通知       : {'✅ 已启用' if (TG_BOT_TOKEN and TG_CHAT_ID) else '⚪ 未启用'}")
     print(f"   SITE_BASE     : {SITE_BASE}")
     print(f"   模式          : {'无头' if HEADLESS else '有头'}")
