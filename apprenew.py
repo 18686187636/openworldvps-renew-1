@@ -5,6 +5,7 @@
 #   - 有头模式 (Xvfb)
 #   - CDP 发鼠标事件（精确时序）
 #   - 滑块初始位置检测
+#   - ⭐ 修正：sub,0 优先 + 跨会话累积策略索引
 
 import os
 import re
@@ -52,15 +53,16 @@ SUPPORTED_KINDS = ("puzzle", "key", "rotate", "odd", "match")
 MAX_SWITCH_PER_SESSION = 8
 MAX_FAIL_PER_SESSION = 5
 
+# ⭐ 修正：sub,0 放第一位（正确答案 = shape_cx - alpha_cx - px）
 ALIGN_STRATEGIES = [
-    ("none",  0),
-    ("none", -1),
-    ("none", +1),
-    ("sub",   0),
+    ("sub",   0),   # shape_cx - alpha_cx - px   ← 正确公式
     ("sub",  -1),
     ("sub",  +1),
-    ("none", -2),
-    ("none", +2),
+    ("sub",  -2),
+    ("sub",  +2),
+    ("none",  0),   # shape_cx - alpha_cx
+    ("none", -1),
+    ("none", +1),
     ("add",   0),
 ]
 
@@ -102,10 +104,6 @@ WS_STATE = {
 def _reset_ws_state():
     WS_STATE.update({"meta": None, "frames": [], "last_resp": None,
                      "sent": [], "closed": False, "fail_pending": False})
-
-
-def _reset_align_pick():
-    ALIGN_STATE["counter"] = 0
 
 
 def _install_ws_hook(page):
@@ -902,24 +900,16 @@ def _drag_slider(page, value, vmax):
             const r = t.getBoundingClientRect();
             out.track_rect = {x: r.x, y: r.y, w: r.width, h: r.height};
         }
-        out.inputs = [];
-        document.querySelectorAll('input').forEach((el, i) => {
-            out.inputs.push({i, type: el.type, name: el.name, id: el.id,
-                             value: el.value, min: el.min, max: el.max});
-        });
         return out;
     }""")
     print(f"   🔬 滑块初始: style.left={probe.get('handle_style_left')!r} "
           f"handle_rect={probe.get('handle_rect')} "
           f"track_rect={probe.get('track_rect')}")
-    if probe.get("inputs"):
-        print(f"      inputs={probe['inputs']}")
 
     h_r = probe.get("handle_rect") or {}
     t_r = probe.get("track_rect") or {}
     hw = h_r.get("w", 24) or 24
 
-    # 推算 handle 当前的 value 分数
     usable = max(1.0, (t_r.get("w", box["width"]) - hw))
     handle_x = h_r.get("x", box["x"])
     track_x = t_r.get("x", box["x"])
@@ -928,7 +918,6 @@ def _drag_slider(page, value, vmax):
     print(f"      📐 推算 start_value ≈ {start_value:.1f}/{vmax} "
           f"(handle.x={handle_x:.1f}, track.x={track_x:.1f}, usable={usable:.1f})")
 
-    # 目标位置：value 对应的 handle.x
     target_frac = max(0.0, min(1.0, value / max(1, vmax)))
     target_x = box["x"] + hw / 2 + target_frac * usable
     start_x  = handle_x + hw / 2
@@ -937,7 +926,7 @@ def _drag_slider(page, value, vmax):
     # === 用 CDP 发事件，精确时序 ===
     s = _cdp(page)
 
-    # 先把鼠标挪到 handle 上
+    # 先把鼠标挪到 handle 附近
     _human_move(s, start_x - random.uniform(80, 200), y - random.uniform(30, 80),
                 start_x, y, total_s=random.uniform(0.3, 0.5))
     _time.sleep(random.uniform(0.1, 0.2))
@@ -1207,8 +1196,11 @@ def _try_renew_session(page, attempt, initial_days):
 
 
 def try_renew_captcha(page, initial_days, max_attempts=6):
+    # ⭐ 修正：counter 只在最开头重置一次，跨会话累积
+    ALIGN_STATE["counter"] = 0
+
     for attempt in range(1, max_attempts + 1):
-        _reset_align_pick()
+        # ⭐ 不再每次 _reset_align_pick()
         try:
             r = _try_renew_session(page, attempt, initial_days)
         except Exception as e:
@@ -1296,6 +1288,7 @@ def check_config():
 def main():
     print("#" * 60)
     print("   Openworld VPS 自动续期 (patchright + headed + CDP)")
+    print("   ⭐ 修正: sub,0 优先 + 跨会话累积策略")
     print("#" * 60)
 
     if not check_config():
