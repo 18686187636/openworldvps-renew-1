@@ -1,445 +1,64 @@
-name: Auto Renew Openworld VPS
+# ============================================================
+# Openworld VPS 自动续期 — GitHub Actions 工作流
+#
+# ⚠️ 使用前必做：
+#   1. 把本文件放到仓库 .github/workflows/renew-openworld.yml
+#   2. 在仓库 Settings → Secrets and variables → Actions 添加：
+#        DISCORD_TOKEN : 必填（Discord Token）
+#        TG_BOT_TOKEN  : 可选（Telegram 机器人 token，不发通知可留空）
+#        TG_CHAT_ID    : 可选（Telegram 对话 id）
+#   3. 把 apprenew.py 一并提交到仓库根目录
+#
+# 定时默认每天 02:23 UTC（北京 10:23），可在下方 cron 调整。
+# ============================================================
+
+name: Openworld VPS 自动续期
 
 on:
   schedule:
-    - cron: '0 2 * * *'
-  workflow_dispatch:
-    inputs:
-      force:
-        description: '强制续期（忽略天数检查）'
-        required: false
-        default: 'false'
-        type: choice
-        options:
-          - 'false'
-          - 'true'
-      record:
-        description: '录屏'
-        required: false
-        default: 'true'
-        type: choice
-        options:
-          - 'true'
-          - 'false'
+    # 每天 02:23 UTC（北京时间 10:23）自动执行
+    - cron: '23 2 * * *'
+  workflow_dispatch: {}    # 支持手动触发
 
-concurrency:
-  group: openworld-renew
-  cancel-in-progress: false
+permissions:
+  contents: read
 
 jobs:
   renew:
-    name: Renew captcha
+    name: 续期
     runs-on: ubuntu-latest
     timeout-minutes: 40
 
     steps:
-      - name: Checkout
+      - name: 检出代码
         uses: actions/checkout@v4
 
-      - name: Setup Python
+      - name: 设置 Python
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
-          cache: 'pip'
-          cache-dependency-path: requirements.txt
 
-      - name: Install system deps (xvfb + ffmpeg + fonts)
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
-            xvfb x11-utils ffmpeg fonts-noto-cjk \
-            libnss3 libatk1.0-0 libatk-bridge2.0-0 libcups2 \
-            libdrm2 libxkbcommon0 libxcomposite1 libxdamage1 \
-            libxfixes3 libxrandr2 libgbm1 libasound2t64
-
-      - name: Install Python deps
+      - name: 安装依赖
         run: |
           python -m pip install --upgrade pip
-          pip install -r requirements.txt
+          pip install playwright requests numpy opencv-python-headless
 
-      - name: Install browsers (patchright + playwright)
-        run: |
-          python -m patchright install --with-deps chromium || \
-            python -m patchright install chromium
-          python -m playwright install --with-deps chromium || true
+      - name: 安装 Chromium（含系统依赖）
+        run: playwright install --with-deps chromium
 
-      # ============================================================
-      # sing-box 代理（可选）
-      # ============================================================
-      - name: Setup sing-box proxy
-        id: singbox
+      - name: 运行续期脚本
         env:
-          NODE_LINK: ${{ secrets.NODE_LINK }}
-          SING_BOX_VERSION: "1.10.7"
-          SINGBOX_CONFIG: "sing-box-config.json"
-        run: |
-          set -e
-          if [ -z "$NODE_LINK" ]; then
-            echo "proxy_ready=false" >> "$GITHUB_OUTPUT"
-            echo "::notice::NODE_LINK 未设置，跳过代理"
-            exit 0
-          fi
-
-          ARCH="$(uname -m)"
-          case "$ARCH" in
-            x86_64|amd64)  SB_ARCH="amd64" ;;
-            aarch64|arm64) SB_ARCH="arm64" ;;
-            *) echo "unsupported arch: $ARCH"; exit 1 ;;
-          esac
-          PKG="sing-box-${SING_BOX_VERSION}-linux-${SB_ARCH}"
-          URL="https://github.com/SagerNet/sing-box/releases/download/v${SING_BOX_VERSION}/${PKG}.tar.gz"
-          for PREFIX in "" "https://ghfast.top/" "https://ghproxy.net/" "https://gh-proxy.com/"; do
-            echo "尝试: ${PREFIX}${URL}"
-            if curl -fL --retry 3 --retry-delay 3 --connect-timeout 20 --max-time 180 \
-                 -o sing-box.tar.gz "${PREFIX}${URL}"; then
-              if file sing-box.tar.gz | grep -q 'gzip compressed data'; then break; fi
-              rm -f sing-box.tar.gz
-            fi
-          done
-          tar -xzf sing-box.tar.gz
-          SING_BOX_DIR=$(find . -maxdepth 1 -type d -name "sing-box-*" | head -1)
-          sudo mv "$SING_BOX_DIR/sing-box" /usr/local/bin/
-          sudo chmod +x /usr/local/bin/sing-box
-          rm -rf sing-box.tar.gz "$SING_BOX_DIR"
-          sing-box version
-
-          python3 - << 'PYEOF'
-          import json, os, re, base64, sys
-          import urllib.request
-          from urllib.parse import urlparse, parse_qs
-
-          NODE_LINK = os.environ.get('NODE_LINK', '').strip()
-          CONFIG_OUT = os.environ.get('SINGBOX_CONFIG', 'sing-box-config.json')
-
-          def log(m): print(f'[setup_singbox] {m}', flush=True)
-
-          def fetch(link):
-              if link.startswith(('http://', 'https://')):
-                  req = urllib.request.Request(link, headers={
-                      'User-Agent': 'sing-box/1.10.7 (setup)'})
-                  with urllib.request.urlopen(req, timeout=30) as r:
-                      return r.read().decode(errors='ignore')
-              return link
-
-          def try_b64(text):
-              s = re.sub(r'\s+', '', text)
-              s += '=' * (-len(s) % 4)
-              try:
-                  dec = base64.b64decode(s, validate=True).decode(errors='ignore')
-                  if '://' in dec: return dec
-              except Exception:
-                  pass
-              return None
-
-          def extract_uris(text):
-              if '://' not in text:
-                  d = try_b64(text)
-                  if d:
-                      log('base64 订阅已解码')
-                      text = d
-              return re.findall(r'(?:vless|vmess|trojan|ss)://\S+', text)
-
-          def _split_hostport(hp):
-              bm = re.match(r'^\[([^\]]+)\](?::(\d+))?$', hp)
-              if bm: return bm.group(1), int(bm.group(2) or 443)
-              if hp.count(':') > 1: return hp, 443
-              if ':' in hp:
-                  h, p = hp.rsplit(':', 1); return h, int(p)
-              return hp, 443
-
-          def _tls_obj(q, default_sni):
-              sec = (q.get('security', ['tls'])[0] or 'tls').lower()
-              if sec == 'none': return None
-              o = {'enabled': True,
-                   'server_name': q.get('sni', [default_sni])[0] or default_sni,
-                   'insecure': False,
-                   'utls': {'enabled': True,
-                            'fingerprint': q.get('fp', ['chrome'])[0] or 'chrome'}}
-              if q.get('alpn'): o['alpn'] = q['alpn'][0].split(',')
-              if sec == 'reality':
-                  o['reality'] = {'enabled': True,
-                                  'public_key': q.get('pbk', [''])[0],
-                                  'short_id': q.get('sid', [''])[0]}
-              return o
-
-          def _transport(q):
-              t = q.get('type', ['tcp'])[0]
-              if t == 'ws':
-                  return {'type': 'ws',
-                          'path': q.get('path', ['/'])[0] or '/',
-                          'headers': ({'Host': q['host'][0]} if q.get('host') else {})}
-              if t == 'grpc':
-                  return {'type': 'grpc',
-                          'service_name': q.get('serviceName', [''])[0] or ''}
-              if t in ('http', 'h2'):
-                  return {'type': 'http',
-                          'host': [q['host'][0]] if q.get('host') else [],
-                          'path': q.get('path', ['/'])[0] or '/'}
-              return None
-
-          def parse_vless(uri):
-              u = urlparse(uri); q = parse_qs(u.query)
-              host, port = _split_hostport(u.netloc.split('@', 1)[-1])
-              ob = {'type': 'vless', 'tag': 'proxy',
-                    'server': host, 'server_port': port,
-                    'uuid': u.username or '', 'packet_encoding': 'xudp'}
-              if q.get('flow', [''])[0]: ob['flow'] = q['flow'][0]
-              tls = _tls_obj(q, host)
-              if tls: ob['tls'] = tls
-              tr = _transport(q)
-              if tr: ob['transport'] = tr
-              return ob
-
-          def parse_vmess(uri):
-              b64 = uri[8:] + '=' * (-len(uri[8:]) % 4)
-              d = json.loads(base64.b64decode(b64).decode(errors='ignore'))
-              host = d.get('add') or d.get('host')
-              port = int(d.get('port') or 443)
-              net = (d.get('net') or 'tcp').lower()
-              tls = (d.get('tls') or '').lower()
-              ob = {'type': 'vmess', 'tag': 'proxy',
-                    'server': host, 'server_port': port,
-                    'uuid': d.get('id'), 'security': d.get('scy') or 'auto',
-                    'alter_id': int(d.get('aid', 0) or 0)}
-              if tls == 'tls':
-                  ob['tls'] = {'enabled': True,
-                               'server_name': d.get('sni') or d.get('host') or host,
-                               'insecure': False}
-              if net == 'ws':
-                  ob['transport'] = {'type': 'ws',
-                                     'path': d.get('path', '/') or '/',
-                                     'headers': ({'Host': d['host']} if d.get('host') else {})}
-              elif net == 'grpc':
-                  ob['transport'] = {'type': 'grpc',
-                                     'service_name': d.get('path', '') or ''}
-              return ob
-
-          def parse_trojan(uri):
-              u = urlparse(uri); q = parse_qs(u.query)
-              host, port = _split_hostport(u.netloc.split('@', 1)[-1])
-              ob = {'type': 'trojan', 'tag': 'proxy',
-                    'server': host, 'server_port': port,
-                    'password': u.username or ''}
-              ob['tls'] = _tls_obj(q, host) or {'enabled': True, 'server_name': host}
-              tr = _transport(q)
-              if tr: ob['transport'] = tr
-              return ob
-
-          def parse_ss(uri):
-              body = uri[5:]
-              if '#' in body: body, _ = body.split('#', 1)
-              if '@' in body:
-                  userinfo, hostport = body.rsplit('@', 1)
-                  try:
-                      userinfo = base64.b64decode(
-                          userinfo + '=' * (-len(userinfo) % 4)).decode()
-                  except Exception:
-                      pass
-                  method, password = userinfo.split(':', 1)
-                  host, port = _split_hostport(hostport)
-              else:
-                  raw = base64.b64decode(body + '=' * (-len(body) % 4)).decode()
-                  userinfo, hostport = raw.rsplit('@', 1)
-                  method, password = userinfo.split(':', 1)
-                  host, port = _split_hostport(hostport)
-              return {'type': 'shadowsocks', 'tag': 'proxy',
-                      'server': host, 'server_port': port,
-                      'method': method, 'password': password}
-
-          PARSERS = {'vless://': parse_vless, 'vmess://': parse_vmess,
-                     'trojan://': parse_trojan, 'ss://': parse_ss}
-
-          def parse_uri(uri):
-              for p, fn in PARSERS.items():
-                  if uri.startswith(p): return fn(uri)
-              return None
-
-          log('下载订阅...')
-          try:
-              text = fetch(NODE_LINK)
-          except Exception as e:
-              log(f'❌ 下载失败: {e}'); sys.exit(1)
-
-          uris = extract_uris(text)
-          log(f'提取到 {len(uris)} 个 URI')
-          if not uris:
-              log('❌ 没有解析到任何节点'); sys.exit(1)
-
-          proxies = []
-          for i, uri in enumerate(uris):
-              try:
-                  ob = parse_uri(uri)
-                  if ob:
-                      log(f'  #{i} {ob["type"]:12s} {ob.get("server")}:{ob.get("server_port")}')
-                      proxies.append(ob)
-              except Exception as e:
-                  log(f'  #{i} 解析失败: {e}')
-
-          if not proxies:
-              log('❌ 所有节点解析失败'); sys.exit(1)
-
-          proxy = proxies[0]
-          proxy['tag'] = 'proxy'
-          log(f'使用节点: {proxy["type"]} {proxy["server"]}:{proxy["server_port"]}')
-
-          config = {
-              'log': {'level': 'warn', 'timestamp': True},
-              'inbounds': [
-                  {'type': 'socks', 'tag': 'socks-in',
-                   'listen': '127.0.0.1', 'listen_port': 1080, 'sniff': True},
-                  {'type': 'http',  'tag': 'http-in',
-                   'listen': '127.0.0.1', 'listen_port': 1081, 'sniff': True},
-              ],
-              'outbounds': [proxy, {'type': 'direct', 'tag': 'direct'}],
-              'route': {
-                  'rules': [{'ip_is_private': True, 'outbound': 'direct'}],
-                  'final': 'proxy',
-              },
-          }
-          with open(CONFIG_OUT, 'w') as f:
-              json.dump(config, f, indent=2, ensure_ascii=False)
-          log(f'✅ 配置已写入 {CONFIG_OUT}')
-          PYEOF
-
-          if [ -f sing-box-config.json ]; then
-            echo "proxy_ready=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "proxy_ready=false" >> "$GITHUB_OUTPUT"
-          fi
-
-      - name: Start sing-box
-        if: steps.singbox.outputs.proxy_ready == 'true'
-        run: |
-          set -e
-          nohup sing-box run -c sing-box-config.json > sing-box.log 2>&1 &
-          echo $! > sing-box.pid
-          sleep 5
-          if ss -tuln 2>/dev/null | grep -q ':1080' && \
-             ss -tuln 2>/dev/null | grep -q ':1081'; then
-            echo "::notice::sing-box 已启动"
-            {
-              echo "HTTPS_PROXY=http://127.0.0.1:1081"
-              echo "HTTP_PROXY=http://127.0.0.1:1081"
-              echo "ALL_PROXY=socks5://127.0.0.1:1080"
-              echo "NO_PROXY=127.0.0.1,localhost"
-            } >> "$GITHUB_ENV"
-          else
-            echo "::warning::sing-box 未监听"
-            cat sing-box.log || true
-          fi
-
-      - name: Check egress IP
-        if: steps.singbox.outputs.proxy_ready == 'true'
-        run: |
-          echo "=== 直连 ==="
-          curl -s --noproxy '*' --max-time 10 https://api.ipify.org && echo "" || true
-          echo "=== 代理 ==="
-          curl -s -x http://127.0.0.1:1081 --max-time 20 https://api.ipify.org && echo "" || true
-          curl -s -x http://127.0.0.1:1081 --max-time 20 https://ipinfo.io/json || true
-
-      # ============================================================
-      # 虚拟显示 + 录屏
-      # ============================================================
-      - name: Start virtual display (Xvfb)
-        run: |
-          Xvfb :99 -screen 0 1440x900x24 -ac +extension RANDR &
-          echo $! > xvfb.pid
-          echo "DISPLAY=:99" >> "$GITHUB_ENV"
-          sleep 2
-          DISPLAY=:99 xdpyinfo | head -5 || true
-
-      - name: Start screen recording (ffmpeg)
-        if: ${{ github.event.inputs.record != 'false' }}
-        run: |
-          mkdir -p screenshots
-          nohup ffmpeg -y -f x11grab -video_size 1440x900 \
-            -framerate 15 -i :99 \
-            -codec:v libx264 -preset ultrafast -pix_fmt yuv420p \
-            screenshots/session.mp4 > ffmpeg.log 2>&1 &
-          echo $! > ffmpeg.pid
-          sleep 2
-          ps -p "$(cat ffmpeg.pid)" > /dev/null && echo "ffmpeg 已启动" || cat ffmpeg.log
-
-      # ============================================================
-      # 指纹 probe（保留，便于诊断）
-      # ============================================================
-      - name: Fingerprint probe
-        env:
-          DISPLAY: ":99"
-        run: |
-          python3 - << 'PYEOF'
-          from patchright.sync_api import sync_playwright
-          with sync_playwright() as p:
-              b = p.chromium.launch(headless=False)
-              pg = b.new_page()
-              fp = pg.evaluate("""() => {
-                  const c = document.createElement('canvas');
-                  const gl = c.getContext('webgl') || c.getContext('experimental-webgl');
-                  const ext = gl && gl.getExtension('WEBGL_debug_renderer_info');
-                  return {
-                      vendor:   gl ? gl.getParameter(ext ? ext.UNMASKED_VENDOR_WEBGL   : gl.VENDOR)   : 'none',
-                      renderer: gl ? gl.getParameter(ext ? ext.UNMASKED_RENDERER_WEBGL : gl.RENDERER) : 'none',
-                      ua: navigator.userAgent,
-                      webdriver: navigator.webdriver,
-                      platform: navigator.platform,
-                      hardwareConcurrency: navigator.hardwareConcurrency,
-                  };
-              }""")
-              import json as _j
-              print(_j.dumps(fp, indent=2, ensure_ascii=False))
-              b.close()
-          PYEOF
-
-      # ============================================================
-      # 主任务
-      # ============================================================
-      - name: Run renew
-        id: renew
-        env:
-          DISCORD_TOKEN:        ${{ secrets.DISCORD_TOKEN }}
-          DISCORD_GUILD_ID:     ${{ secrets.DISCORD_GUILD_ID }}
-          TG_BOT_TOKEN:         ${{ secrets.TG_BOT_TOKEN }}
-          TG_CHAT_ID:           ${{ secrets.TG_CHAT_ID }}
-          ACCOUNT_NAME:         ${{ secrets.ACCOUNT_NAME }}
-          HEADLESS:             "false"
-          RENEW_THRESHOLD_DAYS: "5"
-          FORCE:                ${{ github.event.inputs.force || 'false' }}
-          DISPLAY:              ":99"
+          DISCORD_TOKEN: ${{ secrets.DISCORD_TOKEN }}
+          TG_BOT_TOKEN:  ${{ secrets.TG_BOT_TOKEN }}
+          TG_CHAT_ID:    ${{ secrets.TG_CHAT_ID }}
+          ACCOUNT_NAME:  GitHub Actions
         run: python apprenew.py
 
-      - name: Stop screen recording
-        if: always()
-        run: |
-          if [ -f ffmpeg.pid ]; then
-            kill "$(cat ffmpeg.pid)" 2>/dev/null || true
-            sleep 2
-            ls -la screenshots/ || true
-          fi
-
-      - name: Upload screenshots & recording
+      - name: 上传截图（失败也保留，方便排查）
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: screenshots-${{ github.run_number }}
-          path: |
-            screenshots/
-            ffmpeg.log
+          name: screenshots-${{ github.run_id }}
+          path: screenshots/
+          if-no-files-found: ignore
           retention-days: 7
-          if-no-files-found: ignore
-
-      - name: Upload sing-box log & config
-        if: always() && steps.singbox.outputs.proxy_ready == 'true'
-        uses: actions/upload-artifact@v4
-        with:
-          name: singbox-${{ github.run_number }}
-          path: |
-            sing-box.log
-            sing-box-config.json
-          retention-days: 3
-          if-no-files-found: ignore
-
-      - name: Stop sing-box & xvfb
-        if: always()
-        run: |
-          [ -f sing-box.pid ] && kill "$(cat sing-box.pid)" 2>/dev/null || true
-          [ -f xvfb.pid ]     && kill "$(cat xvfb.pid)"     2>/dev/null || true
