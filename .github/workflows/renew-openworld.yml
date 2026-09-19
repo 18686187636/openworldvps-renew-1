@@ -1,5 +1,15 @@
 # ============================================================
 # Openworld VPS 自动续期 — GitHub Actions 工作流
+#
+# ⚠️ 使用前必做：
+#   1. 把本文件放到仓库 .github/workflows/renew-openworld.yml
+#   2. 在仓库 Settings → Secrets and variables → Actions 添加：
+#        DISCORD_TOKEN : 必填（Discord Token）
+#        TG_BOT_TOKEN  : 可选（Telegram 机器人 token，不发通知可留空）
+#        TG_CHAT_ID    : 可选（Telegram 对话 id）
+#   3. 把 apprenew.py 一并提交到仓库根目录
+#
+# 定时默认每天 02:23 UTC（北京 10:23），可在下方 cron 调整。
 # ============================================================
 
 name: Openworld VPS 自动续期
@@ -27,13 +37,27 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
+          cache: 'pip'    # 缓存 pip 依赖，加速后续运行
 
       - name: 安装依赖
         run: |
           python -m pip install --upgrade pip
           pip install playwright requests numpy opencv-python-headless
 
+      # 缓存 Playwright 浏览器目录，避免每次重装 Chromium
+      # Chromium 与脚本内容无关，仅在 runner 镜像 / playwright 版本变化时才需重装，
+      # 故 key 用固定前缀 + 依赖指纹，让缓存尽量长期命中。
+      - name: 缓存 Playwright
+        id: playwright-cache
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ms-playwright
+          key: playwright-chromium-py311-v1
+          restore-keys: |
+            playwright-chromium-py311-
+
       - name: 安装 Chromium（含系统依赖）
+        if: steps.playwright-cache.outputs.cache-hit != 'true'
         run: playwright install --with-deps chromium
 
       - name: 运行续期脚本
