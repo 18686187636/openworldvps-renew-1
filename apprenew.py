@@ -824,25 +824,57 @@ def _click_match_pairs(page, meta):
 
     match_map = _match_map_for_click(page, meta)
 
-    for i in range(3):
-        li = left[i]
-        px, py = _box_pos_to_page(page, li["x"], li["y"])
-        _hover_to(page, px, py)
-        page.wait_for_timeout(random.randint(40, 120))          # 落到卡上略停再按
-        page.mouse.down()
-        page.wait_for_timeout(random.randint(40, 90))
-        page.mouse.up()
-        page.wait_for_timeout(random.randint(350, 650))        # 左→右之间随机长停顿
+    # 每张卡片：先从一个"别处"的随机位置移过来（人不会从上一个卡片直接
+    # 匀速滑过去），落到卡上再加 ±3~5px 随机偏移（人不会次次点精确中心），
+    # 偶尔二次点击确认。
+    box = page.locator("#captcha_box_default")
+    bb = box.bounding_box()
 
-        rj = right[match_map[i]]
-        px, py = _box_pos_to_page(page, rj["x"], rj["y"])
-        _hover_to(page, px, py)
-        page.wait_for_timeout(random.randint(40, 120))
+    def _jitter_target(px, py):
+        return px + random.uniform(-4, 4), py + random.uniform(-4, 4)
+
+    for i in range(3):
+        # 每对开始先在图内某处 hover 一下（产生行为样本 + 打破匀速感）
+        hx = bb["x"] + bb["width"] * random.uniform(0.15, 0.85)
+        hy = bb["y"] + bb["height"] * random.uniform(0.15, 0.85)
+        page.mouse.move(hx, hy)
+        page.wait_for_timeout(random.randint(150, 400))
+
+        # 左卡
+        lx, ly = _box_pos_to_page(page, left[i]["x"], left[i]["y"])
+        lx, ly = _jitter_target(lx, ly)
+        _hover_to(page, lx, ly)
+        page.wait_for_timeout(random.randint(60, 180))
         page.mouse.down()
-        page.wait_for_timeout(random.randint(40, 90))
+        page.wait_for_timeout(random.randint(50, 120))
         page.mouse.up()
-        page.wait_for_timeout(random.randint(400, 800))        # 每对之间比队内更长停顿
-    page.wait_for_timeout(random.randint(500, 900))
+        if random.random() < 0.35:
+            # 偶尔二次轻点（人确认时的小习惯）
+            page.wait_for_timeout(random.randint(60, 140))
+            page.mouse.down()
+            page.wait_for_timeout(random.randint(30, 70))
+            page.mouse.up()
+        # 左→右间隔大区间随机
+        page.wait_for_timeout(random.randint(400, 1100))
+
+        # 右卡
+        rj = right[match_map[i]]
+        rx, ry = _box_pos_to_page(page, rj["x"], rj["y"])
+        rx, ry = _jitter_target(rx, ry)
+        _hover_to(page, rx, ry)
+        page.wait_for_timeout(random.randint(60, 180))
+        page.mouse.down()
+        page.wait_for_timeout(random.randint(50, 120))
+        page.mouse.up()
+        if random.random() < 0.35:
+            page.wait_for_timeout(random.randint(60, 140))
+            page.mouse.down()
+            page.wait_for_timeout(random.randint(30, 70))
+            page.mouse.up()
+        # 每对之间更长、更随机的停顿
+        page.wait_for_timeout(random.randint(500, 1300))
+
+    page.wait_for_timeout(random.randint(600, 1100))
 
 
 def _match_map_for_click(page, meta):
