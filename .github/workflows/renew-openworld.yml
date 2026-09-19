@@ -5,11 +5,15 @@
 #   1. 把本文件放到仓库 .github/workflows/renew-openworld.yml
 #   2. 在仓库 Settings → Secrets and variables → Actions 添加：
 #        DISCORD_TOKEN : 必填（Discord Token）
-#        TG_BOT_TOKEN  : 可选（Telegram 机器人 token，不发通知可留空）
+#        NODE_LINK     : 必填（sing-box 节点链接，支持
+#                        ss/vmess/vless/trojan，脚本自动识别）
+#        TG_BOT_TOKEN  : 可选（Telegram 机器人 token）
 #        TG_CHAT_ID    : 可选（Telegram 对话 id）
 #   3. 把 apprenew.py 一并提交到仓库根目录
 #
 # 定时默认每天 02:23 UTC（北京 10:23），可在下方 cron 调整。
+# 代理通过 sing-box 本地 SOCKS5 给 Chromium，NODE_LINK 不落地
+# （仅作为 step 内的 environment 传入，不写入磁盘）。
 # ============================================================
 
 name: Openworld VPS 自动续期
@@ -18,7 +22,12 @@ on:
   schedule:
     # 每天 02:23 UTC（北京时间 10:23）自动执行
     - cron: '23 2 * * *'
-  workflow_dispatch: {}    # 支持手动触发
+  workflow_dispatch:
+    inputs:
+      use_proxy:
+        description: '是否使用 NODE_LINK 代理（默认 true）'
+        type: boolean
+        default: true
 
 permissions:
   contents: read
@@ -37,16 +46,116 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
-          cache: 'pip'    # 缓存 pip 依赖，加速后续运行
+          cache: 'pip'
 
       - name: 安装依赖
         run: |
           python -m pip install --upgrade pip
           pip install playwright requests numpy opencv-python-headless
 
-      # 缓存 Playwright 浏览器目录，避免每次重装 Chromium
-      # Chromium 与脚本内容无关，仅在 runner 镜像 / playwright 版本变化时才需重装，
-      # 故 key 用固定前缀 + 依赖指纹，让缓存尽量长期命中。
+      # ---------- 代理（NODE_LINK 私密变量）----------
+      # 只在 use_proxy=true 且 NODE_LINK 存在时启用。
+      # sing-box 配置写进 /tmp/sing-box.json，NODE_LINK 仅通过
+      # 环境变量传入 step 的 run 块，不留在 checkout 的代码目录里。
+
+      - name: 生成 sing-box 配置
+        if: >-
+          inputs.use_proxy ||
+          (github.event_name == 'schedule' && true)
+        env:
+          NODE_LINK: ${{ secrets.NODE_LINK }}
+        run: |
+          if [ -z "$NODE_LINK" ]; then
+            echo "NODE_LINK 未设置，跳过代理，直连运行"
+            echo "USE_PROXY=false" >> $GITHUB_ENV
+            exit 0
+          fi
+          echo "USE_PROXY=true" >> $GITHUB_ENV
+          python3 - <<'PY'
+          import json, re, os
+          link = os.environ["NODE_LINK"].strip()
+          m = re.match(r'^(ss|vmess|vless|trojan)://(.+)$', link)
+          assert m, f"不支持的节点协议: {link[:8]}…"
+          proto, rest = m.group(1), m.group(2)
+          # 分离 fragment（# 之前）和 tag（# 之后）
+          frag, tag = (rest.rsplit('#', 1) if '#' in rest else (rest, None))
+          cfg = {"log": {"level": "warn"}, "inbounds": [
+              {"type": "socks", "listen": "127.0.0.1", "port": 10800,
+               "udp": True}
+          ], "outbounds": []}
+          if proto == "ss":
+              # ss://method:password@host:port
+              mm = re.match(r'^(\w+):(.+)@(\[[\d\.:]+\]|[\w.\-]+):(\d+)$', frag)
+              method, pwd, host, port = mm.groups()
+              cfg["outbounds"].append({
+                  "type": "shadowsocks",
+                  "server": host.strip("[]"), "port": int(port),
+                  "method": method, "password": pwd
+              })
+          elif proto == "vmess":
+              data = json.loads(__import__("base64").urlsafe_b64decode(frag + "="))
+              cfg["outbounds"].append({
+                  "type": "vless",
+                  "server": data["address"], "port": int(data["port"]),
+                  "uuid": data["id"],
+                  "flow": data.get("flow", ""),
+                  "network": data.get("network", "tcp"),
+                  "security": data.get("security", "none"),
+                  "tls": {"serverName": data.get("sni")} if data.get("security") == "reality" else None,
+              })
+          elif proto == "vless":
+              import urllib.parse
+              parts = urllib.parse.urlsplit(frag)
+              q = urllib.parse.parse_qs(parts.query)
+              cfg["outbounds"].append({
+                  "type": "vless",
+                  "server": parts.hostname, "port": int(parts.port),
+                  "uuid": parts.path.lstrip("/"),
+                  "network": q.get("type", ["tcp"])[0],
+                  "security": q.get("security", ["none"])[0],
+                  "tls": {"serverName": q.get("sni", [""])[0]} if q.get("security", ["none"])[0] == "reality" else None,
+              })
+          elif proto == "trojan":
+              import urllib.parse
+              parts = urllib.parse.urlsplit(frag)
+              q = urllib.parse.parse_qs(parts.query)
+              cfg["outbounds"].append({
+                  "type": "trojan",
+                  "server": parts.hostname, "port": int(parts.port),
+                  "password": parts.path.lstrip("/"),
+                  "network": q.get("type", ["tcp"])[0],
+                  "tls": {"serverName": q.get("sni", [parts.hostname])[0]},
+              })
+          # 清理 None 值
+          for ob in cfg["outbounds"]:
+              for k in list(ob):
+                  if ob[k] is None:
+                      del ob[k]
+          with open("/tmp/sing-box.json", "w") as f:
+              json.dump(cfg, f, indent=2)
+          print(f"sing-box 配置已生成（proto={proto}）")
+          PY
+
+      - name: 安装并启动 sing-box
+        if: env.USE_PROXY == 'true'
+        run: |
+          set -e
+          SGVER="v1.11.6"
+          curl -fsSL "https://github.com/SagerNet/sing-box/releases/download/${SGVER}/sing-box-${SGVER}-linux-amd64.tar.gz" \
+               -o /tmp/sg.tar.gz
+          tar -xzf /tmp/sg.tar.gz -C /tmp/
+          SINGBOX="/tmp/sing-box-${SGVER}-linux-amd64/sing-box"
+          "${SINGBOX}" version
+          nohup "${SINGBOX}" run /tmp/sing-box.json > /tmp/sing-box.log 2>&1 &
+          SINGBOX_PID=$!
+          echo "SINGBOX_PID=${SINGBOX_PID}" >> $GITHUB_ENV
+          sleep 2
+          cat /tmp/sing-box.log
+          # 验证 SOCKS5 已监听
+          echo "Testing SOCKS5..."
+          curl -s -x socks5h://127.0.0.1:10800 -o /dev/null -w "%{http_code}" \
+               --max-time 10 https://openworld.eu.org || echo "（代理连通性测试失败，仍继续运行）"
+
       - name: 缓存 Playwright
         id: playwright-cache
         uses: actions/cache@v4
@@ -66,7 +175,27 @@ jobs:
           TG_BOT_TOKEN:  ${{ secrets.TG_BOT_TOKEN }}
           TG_CHAT_ID:    ${{ secrets.TG_CHAT_ID }}
           ACCOUNT_NAME:  GitHub Actions
-        run: python apprenew.py
+          # Chromium 走本地 sing-box SOCKS5 代理（USE_PROXY 为 false 时此变量无效）
+          USE_PROXY: ${{ env.USE_PROXY }}
+          # 传给 Python 脚本读取
+          HTTP_PROXY:  socks5h://127.0.0.1:10800
+          HTTPS_PROXY: socks5h://127.0.0.1:10800
+        run: |
+          # Chromium 的代理参数通过 --proxy-server 传入，见 apprenew.py 的
+          # 环境变量 CHROME_PROXY。若 USE_PROXY=true 则启用。
+          if [ "${{ env.USE_PROXY }}" = "true" ]; then
+            export CHROME_PROXY="socks5://127.0.0.1:10800"
+            echo "代理已启用：${CHROME_PROXY}"
+          else
+            echo "直连模式（未使用代理）"
+          fi
+          python apprenew.py
+
+      - name: 停止 sing-box
+        if: always() && env.USE_PROXY == 'true'
+        run: |
+          [ -n "${SINGBOX_PID:-}" ] && kill "${SINGBOX_PID}" 2>/dev/null || true
+          echo "sing-box 已停止"
 
       - name: 上传截图（失败也保留，方便排查）
         if: always()
