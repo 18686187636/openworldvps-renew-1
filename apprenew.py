@@ -1108,6 +1108,11 @@ def _try_renew_session(page, attempt, initial_days):
 
         resp = WS_STATE["last_resp"]
 
+        # rate 限流：服务端返回 "rate" 表示请求过频，本轮直接放弃
+        if resp == "rate":
+            print("   ⚠️ 收到 rate 限流，本轮不再尝试")
+            return None
+
         if resp and resp.startswith("ok:"):
             token = resp[3:]
             print(f"   🎉 全部通过！token 长度={len(token)}")
@@ -1156,7 +1161,6 @@ def _try_renew_session(page, attempt, initial_days):
         if resp and resp.startswith("bot:"):
             print(f"   ❌ bot: {resp}")
             return None
-
         meta = WS_STATE["meta"]
         if not meta or not meta.get("id"):
             page.wait_for_timeout(300)
