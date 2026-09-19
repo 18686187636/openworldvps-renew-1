@@ -584,19 +584,40 @@ def _solve_rotate(bg_bytes, chip_bytes, meta, tag=""):
     best_rot = best_rot_m = None
     best_px = best_py = 0
 
+    all_scores = {}
     for angle in range(0, 360, 3):
         s, rot, rot_m, px, py = _score(angle)
+        all_scores[angle] = s
         if s > best_score:
             best_score, best_angle = s, angle
             best_rot, best_rot_m = rot, rot_m
             best_px, best_py = px, py
     for da in (-2, -1, 1, 2):
         angle = (best_angle + da) % 360
-        s, rot, rot_m, px, py = _score(angle)
+        if angle not in all_scores:
+            s, rot, rot_m, px, py = _score(angle)
+            all_scores[angle] = s
+        else:
+            s = all_scores[angle]
+            rot, rot_m, px, py = _score(angle)[1:]
         if s > best_score:
             best_score, best_angle = s, angle
             best_rot, best_rot_m = rot, rot_m
             best_px, best_py = px, py
+
+    # 对称歧义消解：180° 对称图标会让 NCC 在 θ 与 θ+180 处出现几乎同高的双峰。
+    # 此时单纯取最高峰可能选到"翻转"的错误朝向。用形状方向线索做裁决：
+    # 比较 θ 与 θ+180 两峰的 NCC，取显著更高者；若几乎相等则保留原 best。
+    alt = (best_angle + 180) % 360
+    alt_score = all_scores.get(alt, _score(alt)[0])
+    if alt_score > best_score + 0.02:
+        s, rot, rot_m, px, py = _score(alt)
+        best_score, best_angle = s, alt
+        best_rot, best_rot_m = rot, rot_m
+        best_px, best_py = px, py
+        print(f"   🔀 对称消歧: 采用 {alt}° (ncc={alt_score:.3f}) 替代 {alt}±180 双峰")
+    elif abs(alt_score - best_score) < 0.05:
+        print(f"   🔀 180° 双峰接近 (ncc={best_score:.3f}/{alt_score:.3f})，保留 {best_angle}°")
 
     print(f"   🎯 rotate: 逆时针={best_angle}° ncc={best_score:.3f}")
 
@@ -890,29 +911,51 @@ def _drag_slider(page, value, vmax):
     target_x = box["x"] + hw / 2 + frac * usable
     start_x = box["x"] + hw / 2
     y = box["y"] + box["height"] / 2
+    dist = target_x - start_x
 
     page.mouse.move(start_x, y)
     page.wait_for_timeout(random.randint(80, 200))
     page.mouse.down()
-    page.wait_for_timeout(random.randint(60, 120))
+    page.wait_for_timeout(random.randint(80, 180))
 
-    steps = random.randint(30, 45)
-    for i in range(1, steps + 1):
-        t = i / steps
-        eased = 1 - (1 - t) ** 2
-        x = start_x + (target_x - start_x) * eased
-        page.mouse.move(x, y + random.uniform(-1.5, 1.5))
-        # 前端 rec() 有 16ms 限流，间隔需 >16ms 才能产生足够行为样本
-        page.wait_for_timeout(random.randint(18, 35))
+    # 真人拖动节奏不均匀：快启动 → 中途变慢/停顿 → 收尾微调。
+    # 分 3 段：60% 距离快速推进，25% 中速并偶有微停顿，15% 缓慢逼近。
+    seg_fracs = [0.60, 0.25, 0.15]
+    seg_steps = [random.randint(14, 18), random.randint(8, 12), random.randint(8, 12)]
+    cum = 0.0
+    for si, (sf, ns) in enumerate(zip(seg_fracs, seg_steps)):
+        seg_end = start_x + dist * (cum + sf)
+        prev = start_x + dist * cum
+        for i in range(1, ns + 1):
+            t = i / ns
+            eased = 1 - (1 - t) ** 2  # 各段内部再缓入
+            x = prev + (seg_end - prev) * eased + random.uniform(-1.2, 1.2)
+            yy = y + random.uniform(-1.5, 1.5)
+            page.mouse.move(x, yy)
+            base_dt = (24, 60) if si == 2 else ((40, 90) if si == 1 else (18, 38))
+            page.wait_for_timeout(random.randint(*base_dt))
+            # 中段偶尔停顿一下（模拟手抖 / 犹豫）
+            if si == 1 and random.random() < 0.25:
+                page.mouse.move(x + random.uniform(-1, 1), yy + random.uniform(-1, 1))
+                page.wait_for_timeout(random.randint(60, 150))
+        cum += sf
 
-    over = random.uniform(3, 6)
+    # 收尾：轻微越过目标再回拉（更像人松手前的小调整）
+    over = random.uniform(2, 5)
     page.mouse.move(target_x + over, y + random.uniform(-2, 2))
-    page.wait_for_timeout(random.randint(50, 90))
-    page.mouse.move(target_x - random.uniform(1, 3), y + random.uniform(-1, 1))
     page.wait_for_timeout(random.randint(40, 80))
+    back = random.uniform(1, 3)
+    page.mouse.move(target_x - back, y + random.uniform(-1, 1))
+    page.wait_for_timeout(random.randint(30, 70))
+    # 回拉后可能再有一次微回弹，最后才稳定
+    if random.random() < 0.5:
+        page.mouse.move(target_x - back + random.uniform(0.5, 1.5),
+                        y + random.uniform(-0.5, 0.5))
+        page.wait_for_timeout(random.randint(20, 50))
     page.mouse.move(target_x + random.uniform(-1, 1), y + random.uniform(-1, 1))
-    page.wait_for_timeout(random.randint(30, 60))
+    page.wait_for_timeout(random.randint(30, 80))
     page.mouse.up()
+    page.wait_for_timeout(random.randint(120, 300))
 
 
 # ================= 一关处理 =================
