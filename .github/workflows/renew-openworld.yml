@@ -245,7 +245,7 @@ jobs:
           DISCORD_TOKEN: ${{ secrets.DISCORD_TOKEN }}
           TG_BOT_TOKEN:  ${{ secrets.TG_BOT_TOKEN }}
           TG_CHAT_ID:    ${{ secrets.TG_CHAT_ID }}
-          ACCOUNT_NAME:  GitHub Actions
+          ACCOUNT_NAME:  ${{ secrets.ACCOUNT_NAME }}
           # 代理启用时：
           #   - Chromium 走本地 sing-box SOCKS5 (CHROME_PROXY，Playwright 内部处理)
           #   - 脚本里 requests (Discord OAuth / Telegram) 走 sing-box 的 HTTP 代理端口 1081
