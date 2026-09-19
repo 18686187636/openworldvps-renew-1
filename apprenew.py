@@ -1394,6 +1394,9 @@ def main() -> int:
     with sync_playwright() as p:
         browser = p.chromium.launch(
             headless=HEADLESS,
+            proxy={
+                "server": os.environ.get("CHROME_PROXY", ""),
+            } if os.environ.get("CHROME_PROXY") else None,
             args=[
                 "--disable-blink-features=AutomationControlled",
                 "--no-sandbox",
