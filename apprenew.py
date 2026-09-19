@@ -985,12 +985,21 @@ def _handle_one_stage(page, meta, frames, tag="", align_idx=0):
             return False
         try:
             value = _solve_puzzle(frames[0], frames[1], meta, align_idx=align_idx)
-            print(f"   🧩 value={value} vmax={meta.get('vmax')}")
-            _drag_slider(page, value, int(meta.get("vmax") or 300))
-            return True
         except Exception as e:
-            print(f"   ❌ puzzle: {e}")
+            print(f"   ⚠️ puzzle 解算失败（{e}），尝试切换 {alt}")
+            if alt in SUPPORTED_KINDS:
+                try:
+                    btn = page.locator("#captcha_switch_default").first
+                    if btn.is_visible(timeout=1500):
+                        btn.click()
+                        print(f"   🔁 切换类型: {kind} → {alt}")
+                        return "switched"
+                except Exception as e2:
+                    print(f"   ⚠️ 切换失败: {e2}")
             return False
+        print(f"   🧩 value={value} vmax={meta.get('vmax')}")
+        _drag_slider(page, value, int(meta.get("vmax") or 300))
+        return True
 
     if kind == "rotate":
         if len(frames) < 2:
@@ -999,7 +1008,16 @@ def _handle_one_stage(page, meta, frames, tag="", align_idx=0):
         try:
             value = _solve_rotate(frames[0], frames[1], meta, tag=tag)
             if value < 0:
-                print("   ⚠️ rotate 求解失败，放弃本次提交")
+                print(f"   ⚠️ rotate 求解失败（NCC 过低），尝试切换 {alt}")
+                if alt in SUPPORTED_KINDS:
+                    try:
+                        btn = page.locator("#captcha_switch_default").first
+                        if btn.is_visible(timeout=1500):
+                            btn.click()
+                            print(f"   🔁 切换类型: rotate → {alt}")
+                            return "switched"
+                    except Exception as e2:
+                        print(f"   ⚠️ 切换失败: {e2}")
                 return False
             print(f"   🎯 value={value} vmax={meta.get('vmax')}")
             _drag_slider(page, value, int(meta.get("vmax") or 359))
