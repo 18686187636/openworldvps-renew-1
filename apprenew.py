@@ -1149,6 +1149,9 @@ def _try_renew_session(page, attempt, initial_days):
             token = resp[3:]
             print(f"   🎉 全部通过！token 长度={len(token)}")
 
+            # 点 Confirm 前截图，记录当时页面状态
+            save_screenshot(page, "confirm_before")
+
             # 点 Confirm 时不再吞异常谎报成功。按钮可能没渲染/被验证码层挡住，
             # 所以分级重试：等渲染 → 强制可见 → 点击，成功才进入天数确认。
             confirm_ok = False
@@ -1174,11 +1177,27 @@ def _try_renew_session(page, attempt, initial_days):
                 except Exception as e:
                     print(f"   ❌ Confirm 未能点击: {e}")
 
-            page.wait_for_timeout(5000)
+            # 点 Confirm 后立刻截图，看页面实际状态
+            save_screenshot(page, "confirm_after")
 
-            # 点 Confirm 后先停一会让服务端处理，再刷新读天数。
-            # 刷新次数不能太多——密集 reload 会触发 rate 限流，导致加天不生效。
-            # 策略：最多 3 次刷新，每次间隔 8s，给服务端足够冷却。
+            # 等这个 POST 真正完成。Confirm 是 <form method=POST> 的 submit 按钮，
+            # 点下去浏览器会发 POST /vps/{id}/renew，成功后跳回带新天数的页面。
+            # 之前的问题是：点完立刻 page.reload() 会取消/打断这个 POST，导致加天没落地。
+            # 现在改为等 URL 变化或 body 出现成功提示，最多等 15s。
+            page.wait_for_timeout(3000)
+            try:
+                page.wait_for_url(
+                    re.compile(r"/vps/"),
+                    timeout=15000,
+                    wait_until="domcontentloaded")
+            except Exception:
+                pass
+            wait_for_cloudflare(page)
+
+            # 再截一张，看提交后页面
+            save_screenshot(page, "confirm_result")
+
+            # 服务端给 VPS 加天可能有延迟，轮询读天数（最多 3 次，间隔 8s 防 rate 限流）
             new_days = None
             for _ in range(3):
                 try:
