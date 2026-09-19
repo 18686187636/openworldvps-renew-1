@@ -85,6 +85,7 @@ ALIGN_STRATEGIES = [
 ]
 
 ROTATE_NCC_MIN = 0.35
+ROTATE_NCC_SUBMIT = 0.50   # NCC 低于此值时认为方向不确定，直接切 alt 而非提交
 ALIGN_STATE = {"counter": 0}
 
 
@@ -638,8 +639,8 @@ def _solve_rotate(bg_bytes, chip_bytes, meta, tag=""):
     except Exception as e:
         print(f"   ⚠️ 可视化: {e}")
 
-    if best_score < ROTATE_NCC_MIN:
-        print(f"   ⚠️ NCC 低于阈值 {ROTATE_NCC_MIN}，放弃本次提交")
+    if best_score < ROTATE_NCC_SUBMIT:
+        print(f"   ⚠️ NCC {best_score:.3f} 低于提交阈值 {ROTATE_NCC_SUBMIT}，放弃提交")
         return -1
 
     return (360 - best_angle) % 360
@@ -827,19 +828,21 @@ def _click_match_pairs(page, meta):
         li = left[i]
         px, py = _box_pos_to_page(page, li["x"], li["y"])
         _hover_to(page, px, py)
+        page.wait_for_timeout(random.randint(40, 120))          # 落到卡上略停再按
         page.mouse.down()
-        page.wait_for_timeout(random.randint(30, 70))
+        page.wait_for_timeout(random.randint(40, 90))
         page.mouse.up()
-        page.wait_for_timeout(random.randint(250, 450))
+        page.wait_for_timeout(random.randint(350, 650))        # 左→右之间随机长停顿
 
         rj = right[match_map[i]]
         px, py = _box_pos_to_page(page, rj["x"], rj["y"])
         _hover_to(page, px, py)
+        page.wait_for_timeout(random.randint(40, 120))
         page.mouse.down()
-        page.wait_for_timeout(random.randint(30, 70))
+        page.wait_for_timeout(random.randint(40, 90))
         page.mouse.up()
-        page.wait_for_timeout(random.randint(250, 450))
-    page.wait_for_timeout(500)
+        page.wait_for_timeout(random.randint(400, 800))        # 每对之间比队内更长停顿
+    page.wait_for_timeout(random.randint(500, 900))
 
 
 def _match_map_for_click(page, meta):
