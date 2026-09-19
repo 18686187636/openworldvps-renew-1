@@ -1148,20 +1148,39 @@ def _try_renew_session(page, attempt, initial_days):
         if resp and resp.startswith("ok:"):
             token = resp[3:]
             print(f"   🎉 全部通过！token 长度={len(token)}")
-            try:
-                confirm = page.locator("button.btn-primary:has-text('Confirm Renewal')").first
-                confirm.wait_for(state="visible", timeout=5000)
-                confirm.click()
-                print("   ✅ 已点击 Confirm Renewal")
-            except Exception as e:
-                print(f"   ⚠️ Confirm: {e}")
 
-            page.wait_for_timeout(4000)
+            # 点 Confirm 时不再吞异常谎报成功。按钮可能没渲染/被验证码层挡住，
+            # 所以分级重试：等渲染 → 强制可见 → 点击，成功才进入天数确认。
+            confirm_ok = False
+            for sel in ("button.btn-primary:has-text('Confirm Renewal')",
+                         "button:has-text('Confirm Renewal')",
+                         "button:has-text('Confirm')"):
+                try:
+                    confirm = page.locator(sel).first
+                    confirm.wait_for(state="visible", timeout=6000)
+                    confirm.click(timeout=3000)
+                    print(f"   ✅ 已点击 Confirm Renewal ({sel})")
+                    confirm_ok = True
+                    break
+                except Exception as e:
+                    print(f"   ⚠️ Confirm 选择器 {sel} 失败: {str(e)[:120]}")
+            if not confirm_ok:
+                # 都没点中：再宽等一次后强制点第一个匹配的（force 绕过被遮挡）
+                try:
+                    page.locator("button:has-text('Confirm')").first.click(
+                        timeout=3000, force=True)
+                    print("   ✅ 已强制点击 Confirm")
+                    confirm_ok = True
+                except Exception as e:
+                    print(f"   ❌ Confirm 未能点击: {e}")
 
-            # 服务端给 VPS 加天可能延迟，轮询直到剩余天数真正增加（最多 ~30s）。
-            # 只有确认到 new_days > initial_days 才算续期成功，避免把失败当成功。
+            page.wait_for_timeout(5000)
+
+            # 点 Confirm 后先停一会让服务端处理，再刷新读天数。
+            # 刷新次数不能太多——密集 reload 会触发 rate 限流，导致加天不生效。
+            # 策略：最多 3 次刷新，每次间隔 8s，给服务端足够冷却。
             new_days = None
-            for _ in range(15):
+            for _ in range(3):
                 try:
                     page.reload(wait_until="domcontentloaded", timeout=30000)
                 except Exception:
@@ -1175,16 +1194,18 @@ def _try_renew_session(page, attempt, initial_days):
                 m = re.search(r"[Rr]enews?\s+in\s+(\d+)\s+days?", text)
                 if m:
                     candidate = int(m.group(1))
+                    print(f"   📊 刷新后剩余: {candidate} 天")
                     if candidate > initial_days:
                         new_days = candidate
                         break
-                page.wait_for_timeout(1500)
+                page.wait_for_timeout(8000)
 
             if new_days is not None:
                 print(f"   ✅ 续期成功！{initial_days} → {new_days} 天")
                 return True
 
-            print("   ❌ 已拿到 token 并 Confirm，但 30s 内未检测到天数增加，判定失败")
+            print(f"   ❌ 已拿到 token，Confirm={confirm_ok}，但多次刷新后"
+                  f"仍未检测到天数增加，判定失败")
             return None
 
         if resp in ("burned", "blocked", "rate"):
