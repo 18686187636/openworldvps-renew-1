@@ -1109,7 +1109,7 @@ def _try_renew_session(page, attempt, initial_days):
             token = resp[3:]
             print(f"   🎉 全部通过！token 长度={len(token)}")
             try:
-                confirm = page.locator("button:has-text('Confirm Renewal')").first
+                confirm = page.locator("button.btn-primary:has-text('Confirm Renewal')").first
                 confirm.wait_for(state="visible", timeout=5000)
                 confirm.click()
                 print("   ✅ 已点击 Confirm Renewal")
@@ -1117,27 +1117,34 @@ def _try_renew_session(page, attempt, initial_days):
                 print(f"   ⚠️ Confirm: {e}")
 
             page.wait_for_timeout(4000)
-            try:
-                page.reload(wait_until="domcontentloaded", timeout=30000)
-            except Exception:
-                pass
-            wait_for_cloudflare(page)
-            page.wait_for_timeout(2000)
 
-            try:
-                text = page.locator("body").inner_text()
-            except Exception:
-                text = ""
-            m = re.search(r"[Rr]enews?\s+in\s+(\d+)\s+days?", text)
-            if m:
-                new_days = int(m.group(1))
-                print(f"   📊 刷新后剩余: {new_days} 天")
-                if new_days > initial_days:
-                    print(f"   ✅ 续期成功！{initial_days} → {new_days} 天")
-                    return True
-                print("   ❌ 未增加")
-                return None
-            print("   ⚠️ 无法解析天数")
+            # 服务端给 VPS 加天可能延迟，轮询直到剩余天数真正增加（最多 ~30s）。
+            # 只有确认到 new_days > initial_days 才算续期成功，避免把失败当成功。
+            new_days = None
+            for _ in range(15):
+                try:
+                    page.reload(wait_until="domcontentloaded", timeout=30000)
+                except Exception:
+                    pass
+                wait_for_cloudflare(page)
+                page.wait_for_timeout(2000)
+                try:
+                    text = page.locator("body").inner_text()
+                except Exception:
+                    text = ""
+                m = re.search(r"[Rr]enews?\s+in\s+(\d+)\s+days?", text)
+                if m:
+                    candidate = int(m.group(1))
+                    if candidate > initial_days:
+                        new_days = candidate
+                        break
+                page.wait_for_timeout(1500)
+
+            if new_days is not None:
+                print(f"   ✅ 续期成功！{initial_days} → {new_days} 天")
+                return True
+
+            print("   ❌ 已拿到 token 并 Confirm，但 30s 内未检测到天数增加，判定失败")
             return None
 
         if resp in ("burned", "blocked", "rate"):
