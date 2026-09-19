@@ -223,6 +223,16 @@ jobs:
           if ss -tuln | grep -q ':1080'; then
             echo "✅ SOCKS5 代理已启动 (127.0.0.1:1080)"
             echo "✅ HTTP  代理已启动 (127.0.0.1:1081)"
+            # 检测出口 IP，确认流量真的走了代理（对比直连与代理两个出口）
+            DIRECT_IP="$(curl -s --max-time 8 https://api.ipify.org || echo 'unknown')"
+            PROXY_IP="$(curl -s --max-time 15 -x http://127.0.0.1:1081 https://api.ipify.org || echo 'unknown')"
+            echo "📡 直连出口 IP: $DIRECT_IP"
+            echo "📡 代理出口 IP: $PROXY_IP"
+            if [ "$PROXY_IP" = "unknown" ]; then
+              echo "❌ 代理出口 IP 检测失败，代理可能没生效"
+              cat sing-box.log
+              exit 1
+            fi
             echo "USE_PROXY=true" >> $GITHUB_ENV
           else
             echo "❌ 代理启动失败，日志如下:"
@@ -249,14 +259,18 @@ jobs:
           TG_BOT_TOKEN:  ${{ secrets.TG_BOT_TOKEN }}
           TG_CHAT_ID:    ${{ secrets.TG_CHAT_ID }}
           ACCOUNT_NAME:  GitHub Actions
-          # 代理启用时让 Chromium 走本地 sing-box SOCKS5
+          # 代理启用时：
+          #   - Chromium 走本地 sing-box SOCKS5 (CHROME_PROXY，Playwright 内部处理)
+          #   - 脚本里 requests (Discord OAuth / Telegram) 走 sing-box 的 HTTP 代理端口 1081
+          #     （requests 走 HTTP 代理不需要 PySocks；若设成 socks5h 会报
+          #     "Missing dependencies for SOCKS support"）
           CHROME_PROXY: socks5://127.0.0.1:1080
-          HTTP_PROXY:  socks5h://127.0.0.1:1080
-          HTTPS_PROXY: socks5h://127.0.0.1:1080
+          HTTP_PROXY:  http://127.0.0.1:1081
+          HTTPS_PROXY: http://127.0.0.1:1081
           NO_PROXY: 127.0.0.1,localhost
         run: |
           if [ "$USE_PROXY" = "true" ]; then
-            echo "代理已启用：Chromium 走 ${CHROME_PROXY}"
+            echo "代理已启用：Chromium 走 ${CHROME_PROXY}，requests 走 ${HTTP_PROXY}"
           else
             echo "直连模式（未使用代理）"
             # 直连时清掉代理变量，避免脚本误读
