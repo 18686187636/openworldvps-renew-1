@@ -5,15 +5,14 @@
 #   1. 把本文件放到仓库 .github/workflows/renew-openworld.yml
 #   2. 在仓库 Settings → Secrets and variables → Actions 添加：
 #        DISCORD_TOKEN : 必填（Discord Token）
-#        NODE_LINK     : 必填（sing-box 节点链接，支持
-#                        ss/vmess/vless/trojan，脚本自动识别）
+#        NODE_LINK     : 必填（vless 节点链接，sing-box 走代理续订）
 #        TG_BOT_TOKEN  : 可选（Telegram 机器人 token）
 #        TG_CHAT_ID    : 可选（Telegram 对话 id）
 #   3. 把 apprenew.py 一并提交到仓库根目录
 #
 # 定时默认每天 02:23 UTC（北京 10:23），可在下方 cron 调整。
-# 代理通过 sing-box 本地 SOCKS5 给 Chromium，NODE_LINK 不落地
-# （仅作为 step 内的 environment 传入，不写入磁盘）。
+# 代理：NODE_LINK 是私密 Secret，只经 step 的 env 传入，不落到 checkout 目录。
+# Chromium 通过 sing-box 本地 SOCKS5 (127.0.0.1:1080) 走代理续订。
 # ============================================================
 
 name: Openworld VPS 自动续期
@@ -38,6 +37,10 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 40
 
+    env:
+      SING_BOX_VERSION: "1.10.7"
+      SING_BOX_DIR: "sing-box-install"
+
     steps:
       - name: 检出代码
         uses: actions/checkout@v4
@@ -53,108 +56,179 @@ jobs:
           python -m pip install --upgrade pip
           pip install playwright requests numpy opencv-python-headless
 
-      # ---------- 代理（NODE_LINK 私密变量）----------
-      # 只在 use_proxy=true 且 NODE_LINK 存在时启用。
-      # sing-box 配置写进 /tmp/sing-box.json，NODE_LINK 仅通过
-      # 环境变量传入 step 的 run 块，不留在 checkout 的代码目录里。
+      # ---------- 代理（NODE_LINK 私密 Secret，vless）----------
+      # 只在 use_proxy=true（或定时触发）且 NODE_LINK 存在时启用。
+      # sing-box 配置写进 sing-box-config.json（临时工作区），
+      # NODE_LINK 仅经 step 的 env 传入 run 块，不留在 checkout 代码目录。
 
-      - name: 生成 sing-box 配置
+      - name: Configure sing-box proxy
         if: >-
-          inputs.use_proxy ||
-          (github.event_name == 'schedule' && true)
+          (inputs.use_proxy || github.event_name == 'schedule')
         env:
           NODE_LINK: ${{ secrets.NODE_LINK }}
         run: |
+          set -e
+
           if [ -z "$NODE_LINK" ]; then
-            echo "NODE_LINK 未设置，跳过代理，直连运行"
+            echo "⚠️ NODE_LINK 未配置，跳过 sing-box 代理，直连运行"
             echo "USE_PROXY=false" >> $GITHUB_ENV
             exit 0
           fi
-          echo "USE_PROXY=true" >> $GITHUB_ENV
-          python3 - <<'PY'
-          import json, re, os
-          link = os.environ["NODE_LINK"].strip()
-          m = re.match(r'^(ss|vmess|vless|trojan)://(.+)$', link)
-          assert m, f"不支持的节点协议: {link[:8]}…"
-          proto, rest = m.group(1), m.group(2)
-          # 分离 fragment（# 之前）和 tag（# 之后）
-          frag, tag = (rest.rsplit('#', 1) if '#' in rest else (rest, None))
-          cfg = {"log": {"level": "warn"}, "inbounds": [
-              {"type": "socks", "listen": "127.0.0.1", "port": 10800,
-               "udp": True}
-          ], "outbounds": []}
-          if proto == "ss":
-              # ss://method:password@host:port
-              mm = re.match(r'^(\w+):(.+)@(\[[\d\.:]+\]|[\w.\-]+):(\d+)$', frag)
-              method, pwd, host, port = mm.groups()
-              cfg["outbounds"].append({
-                  "type": "shadowsocks",
-                  "server": host.strip("[]"), "port": int(port),
-                  "method": method, "password": pwd
-              })
-          elif proto == "vmess":
-              data = json.loads(__import__("base64").urlsafe_b64decode(frag + "="))
-              cfg["outbounds"].append({
-                  "type": "vless",
-                  "server": data["address"], "port": int(data["port"]),
-                  "uuid": data["id"],
-                  "flow": data.get("flow", ""),
-                  "network": data.get("network", "tcp"),
-                  "security": data.get("security", "none"),
-                  "tls": {"serverName": data.get("sni")} if data.get("security") == "reality" else None,
-              })
-          elif proto == "vless":
-              import urllib.parse
-              parts = urllib.parse.urlsplit(frag)
-              q = urllib.parse.parse_qs(parts.query)
-              cfg["outbounds"].append({
-                  "type": "vless",
-                  "server": parts.hostname, "port": int(parts.port),
-                  "uuid": parts.path.lstrip("/"),
-                  "network": q.get("type", ["tcp"])[0],
-                  "security": q.get("security", ["none"])[0],
-                  "tls": {"serverName": q.get("sni", [""])[0]} if q.get("security", ["none"])[0] == "reality" else None,
-              })
-          elif proto == "trojan":
-              import urllib.parse
-              parts = urllib.parse.urlsplit(frag)
-              q = urllib.parse.parse_qs(parts.query)
-              cfg["outbounds"].append({
-                  "type": "trojan",
-                  "server": parts.hostname, "port": int(parts.port),
-                  "password": parts.path.lstrip("/"),
-                  "network": q.get("type", ["tcp"])[0],
-                  "tls": {"serverName": q.get("sni", [parts.hostname])[0]},
-              })
-          # 清理 None 值
-          for ob in cfg["outbounds"]:
-              for k in list(ob):
-                  if ob[k] is None:
-                      del ob[k]
-          with open("/tmp/sing-box.json", "w") as f:
-              json.dump(cfg, f, indent=2)
-          print(f"sing-box 配置已生成（proto={proto}）")
-          PY
 
-      - name: 安装并启动 sing-box
-        if: env.USE_PROXY == 'true'
-        run: |
-          set -e
-          SGVER="v1.11.6"
-          curl -fsSL "https://github.com/SagerNet/sing-box/releases/download/${SGVER}/sing-box-${SGVER}-linux-amd64.tar.gz" \
-               -o /tmp/sg.tar.gz
-          tar -xzf /tmp/sg.tar.gz -C /tmp/
-          SINGBOX="/tmp/sing-box-${SGVER}-linux-amd64/sing-box"
-          "${SINGBOX}" version
-          nohup "${SINGBOX}" run /tmp/sing-box.json > /tmp/sing-box.log 2>&1 &
-          SINGBOX_PID=$!
-          echo "SINGBOX_PID=${SINGBOX_PID}" >> $GITHUB_ENV
-          sleep 2
-          cat /tmp/sing-box.log
-          # 验证 SOCKS5 已监听
-          echo "Testing SOCKS5..."
-          curl -s -x socks5h://127.0.0.1:10800 -o /dev/null -w "%{http_code}" \
-               --max-time 10 https://openworld.eu.org || echo "（代理连通性测试失败，仍继续运行）"
+          ARCH="$(uname -m)"
+          case "$ARCH" in
+            x86_64|amd64)  SB_ARCH="amd64" ;;
+            aarch64|arm64) SB_ARCH="arm64" ;;
+            *) echo "❌ 不支持的架构: $ARCH"; exit 1 ;;
+          esac
+
+          PKG="sing-box-${SING_BOX_VERSION}-linux-${SB_ARCH}"
+          URL="https://github.com/SagerNet/sing-box/releases/download/v${SING_BOX_VERSION}/${PKG}.tar.gz"
+
+          echo "⬇️ 下载 sing-box: $URL"
+
+          download_ok=0
+          for PREFIX in "" "https://ghfast.top/" "https://ghproxy.net/" "https://gh-proxy.com/"; do
+            echo "  尝试: ${PREFIX}${URL}"
+            if curl -fL --retry 3 --retry-delay 3 --connect-timeout 20 --max-time 180 \
+                 -o sing-box.tar.gz "${PREFIX}${URL}"; then
+              if file sing-box.tar.gz | grep -q 'gzip compressed data'; then
+                echo "  ✅ 下载成功 (${PREFIX:-direct})"
+                download_ok=1
+                break
+              else
+                echo "  ⚠️ 文件不是 gzip，继续尝试下一个源"
+                rm -f sing-box.tar.gz
+              fi
+            fi
+          done
+
+          if [ "$download_ok" != "1" ]; then
+            echo "❌ sing-box 所有下载源均失败"
+            exit 1
+          fi
+
+          tar -xzf sing-box.tar.gz
+          SING_BOX_DIR="$(find . -maxdepth 1 -type d -name "sing-box-${SING_BOX_VERSION}-*" | head -1)"
+          if [ -z "$SING_BOX_DIR" ]; then
+            echo "❌ 解压后未找到 sing-box 目录"
+            ls -la
+            exit 1
+          fi
+          mv "${SING_BOX_DIR}/sing-box" ./sing-box-bin
+          chmod +x ./sing-box-bin
+          rm -rf sing-box.tar.gz "${SING_BOX_DIR}"
+          ./sing-box-bin version
+
+          echo "📝 解析 vless 链接并生成配置..."
+          python3 << 'PYEOF'
+          import json, sys, os
+          from urllib.parse import urlparse, parse_qs
+
+          link = os.environ.get('NODE_LINK', '')
+          if not link:
+            sys.exit(0)
+
+          parsed = urlparse(link)
+          if parsed.scheme != 'vless':
+              print(f"⚠️ 不支持的协议: {parsed.scheme}，跳过代理")
+              sys.exit(0)
+
+          netloc = parsed.netloc
+          if '@' in netloc:
+              uuid, host_port = netloc.split('@', 1)
+          else:
+              uuid, host_port = '', netloc
+
+          host = ''
+          port = '443'
+          import re
+          bracket_match = re.match(r'^\[([^\]]+)\](?::(\d+))?$', host_port)
+          if bracket_match:
+              host = bracket_match.group(1)
+              if bracket_match.group(2):
+                  port = bracket_match.group(2)
+          else:
+              if ':' in host_port:
+                  host, port = host_port.rsplit(':', 1)
+              else:
+                  host = host_port
+
+          if not host:
+              print(f"❌ 无法解析 host: {host_port}")
+              sys.exit(1)
+
+          params = parse_qs(parsed.query)
+          sni = params.get('sni', [host])[0] or host
+          fp  = params.get('fp', ['chrome'])[0] or 'chrome'
+          flow = params.get('flow', [''])[0] or ''
+          type_ = params.get('type', ['tcp'])[0]
+          security = params.get('security', [''])[0]
+          path = params.get('path', [''])[0]
+          host_header = params.get('host', [host])[0] or host
+
+          outbound = {
+              "type": "vless",
+              "tag": "vless-out",
+              "server": host,
+              "server_port": int(port),
+              "uuid": uuid,
+              "packet_encoding": "packetaddr",
+          }
+          if flow:
+              outbound["flow"] = flow
+
+          if security and security.lower() != 'none':
+              tls = {
+                  "enabled": True,
+                  "server_name": sni,
+                  "insecure": False,
+                  "utls": {"enabled": True, "fingerprint": fp}
+              }
+              if security.lower() == 'reality':
+                  pbk = params.get('pbk', [''])[0]
+                  sid = params.get('sid', [''])[0]
+                  tls["reality"] = {"enabled": True, "public_key": pbk, "short_id": sid}
+              outbound["tls"] = tls
+
+          if type_ != 'tcp':
+              transport = {"type": type_}
+              if type_ == 'ws':
+                  transport["path"] = path or "/"
+                  transport["headers"] = {"Host": host_header}
+              elif type_ == 'grpc':
+                  transport["service_name"] = path or ""
+              outbound["transport"] = transport
+
+          config = {
+              "log": {"level": "warn"},
+              "inbounds": [
+                  {"type": "socks", "tag": "socks-in", "listen": "127.0.0.1", "listen_port": 1080},
+                  {"type": "http",  "tag": "http-in",  "listen": "127.0.0.1", "listen_port": 1081}
+              ],
+              "outbounds": [outbound],
+              "route": {"rules": [{"outbound": "vless-out", "protocol": ["tcp", "udp"]}]}
+          }
+
+          with open("sing-box-config.json", "w") as f:
+              json.dump(config, f, indent=2)
+          print("✅ sing-box-config.json 已生成")
+          PYEOF
+
+          echo "🚀 启动 sing-box..."
+          nohup ./sing-box-bin run -c sing-box-config.json > sing-box.log 2>&1 &
+          SING_BOX_PID=$!
+          echo "SING_BOX_PID=${SING_BOX_PID}" >> $GITHUB_ENV
+          sleep 5
+          if ss -tuln | grep -q ':1080'; then
+            echo "✅ SOCKS5 代理已启动 (127.0.0.1:1080)"
+            echo "✅ HTTP  代理已启动 (127.0.0.1:1081)"
+            echo "USE_PROXY=true" >> $GITHUB_ENV
+          else
+            echo "❌ 代理启动失败，日志如下:"
+            cat sing-box.log
+            exit 1
+          fi
 
       - name: 缓存 Playwright
         id: playwright-cache
@@ -175,27 +249,28 @@ jobs:
           TG_BOT_TOKEN:  ${{ secrets.TG_BOT_TOKEN }}
           TG_CHAT_ID:    ${{ secrets.TG_CHAT_ID }}
           ACCOUNT_NAME:  GitHub Actions
-          # Chromium 走本地 sing-box SOCKS5 代理（USE_PROXY 为 false 时此变量无效）
-          USE_PROXY: ${{ env.USE_PROXY }}
-          # 传给 Python 脚本读取
-          HTTP_PROXY:  socks5h://127.0.0.1:10800
-          HTTPS_PROXY: socks5h://127.0.0.1:10800
+          # 代理启用时让 Chromium 走本地 sing-box SOCKS5
+          CHROME_PROXY: socks5://127.0.0.1:1080
+          HTTP_PROXY:  socks5h://127.0.0.1:1080
+          HTTPS_PROXY: socks5h://127.0.0.1:1080
+          NO_PROXY: 127.0.0.1,localhost
         run: |
-          # Chromium 的代理参数通过 --proxy-server 传入，见 apprenew.py 的
-          # 环境变量 CHROME_PROXY。若 USE_PROXY=true 则启用。
-          if [ "${{ env.USE_PROXY }}" = "true" ]; then
-            export CHROME_PROXY="socks5://127.0.0.1:10800"
-            echo "代理已启用：${CHROME_PROXY}"
+          if [ "$USE_PROXY" = "true" ]; then
+            echo "代理已启用：Chromium 走 ${CHROME_PROXY}"
           else
             echo "直连模式（未使用代理）"
+            # 直连时清掉代理变量，避免脚本误读
+            unset CHROME_PROXY HTTP_PROXY HTTPS_PROXY
           fi
           python apprenew.py
 
       - name: 停止 sing-box
         if: always() && env.USE_PROXY == 'true'
         run: |
-          [ -n "${SINGBOX_PID:-}" ] && kill "${SINGBOX_PID}" 2>/dev/null || true
-          echo "sing-box 已停止"
+          if [ -n "${SING_BOX_PID:-}" ] && kill -0 "${SING_BOX_PID}" 2>/dev/null; then
+            kill "${SING_BOX_PID}" 2>/dev/null || true
+            echo "sing-box 已停止"
+          fi
 
       - name: 上传截图（失败也保留，方便排查）
         if: always()
