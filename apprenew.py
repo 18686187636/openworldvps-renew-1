@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-# v20-github: GitHub Actions 版（无头、Secret 配置、无交互暂停、失败非零退出）
+
 
 import os
 import re
@@ -24,33 +24,23 @@ except ImportError:
     sys.exit(1)
 
 
-# ============================================================
-# ⭐ GitHub Actions 配置：全部从 Secret / 环境变量读取
-# ============================================================
 CONFIG = {
-    # 必填：Discord Token（GitHub Secret: DISCORD_TOKEN）
     "DISCORD_TOKEN": os.environ.get("DISCORD_TOKEN", "").strip(),
-
-    # 可选：Telegram 通知（GitHub Secret: TG_BOT_TOKEN / TG_CHAT_ID，留空就不发）
     "TG_BOT_TOKEN":  os.environ.get("TG_BOT_TOKEN", "").strip(),
     "TG_CHAT_ID":    os.environ.get("TG_CHAT_ID", "").strip(),
     "ACCOUNT_NAME":  os.environ.get("ACCOUNT_NAME", "GitHub Actions"),
-
-    # 站点
     "SITE_BASE": "https://openworld.eu.org",
-
-    # 站点 Discord 服务器 id（OAuth authorize 请求用，抓包固定值）
     "DISCORD_GUILD_ID": "1525632757072658502",
-
-    # CI 模式：无头、不暂停、截图目录在仓库内（供 Artifact 上传）
     "HEADLESS": True,
     "SCREENSHOT_DIR": "./screenshots",
     "RENEW_THRESHOLD_DAYS": 5,
+    "MATCH_STRATEGY": os.environ.get("MATCH_STRATEGY", "same").strip().lower(),
+    # ★ 新增：rotate 方向
+    #   direct  → value = best_angle（假设服务端期望"chip 已转的角度"）
+    #   inverse → value = (360 - best_angle) % 360（假设服务端期望"要转回去的角度"）
+    "ROTATE_MODE": os.environ.get("ROTATE_MODE", "direct").strip().lower(),
 }
-# ============================================================
 
-
-# 把配置应用到全局常量
 DISCORD_TOKEN = CONFIG["DISCORD_TOKEN"]
 DISCORD_GUILD_ID = CONFIG["DISCORD_GUILD_ID"]
 TG_CHAT_ID    = CONFIG["TG_CHAT_ID"]
@@ -60,33 +50,28 @@ SITE_BASE     = CONFIG["SITE_BASE"]
 HEADLESS      = CONFIG["HEADLESS"]
 SCREENSHOT_DIR = CONFIG["SCREENSHOT_DIR"]
 RENEW_THRESHOLD_DAYS = CONFIG["RENEW_THRESHOLD_DAYS"]
+MATCH_STRATEGY = CONFIG["MATCH_STRATEGY"]
+ROTATE_MODE = CONFIG["ROTATE_MODE"]
 
-# 脚本所在目录
 SCRIPT_DIR = Path(__file__).resolve().parent
 if not os.path.isabs(SCREENSHOT_DIR):
     SCREENSHOT_DIR = str(SCRIPT_DIR / SCREENSHOT_DIR)
 os.makedirs(SCREENSHOT_DIR, exist_ok=True)
 
-
 SUPPORTED_KINDS = ("puzzle", "key", "rotate", "odd", "match")
-MAX_SWITCH_PER_SESSION = 8
-MAX_FAIL_PER_SESSION = 5
+MAX_SWITCH_PER_SESSION = 4
+MAX_FAIL_PER_SESSION = 3
 
 ALIGN_STRATEGIES = [
-    ("none",  0),
-    ("none", -1),
-    ("none", +1),
-    ("sub",   0),
-    ("sub",  -1),
-    ("sub",  +1),
-    ("none", -2),
-    ("none", +2),
-    ("add",   0),
+    ("none",  0), ("none", -1), ("none", +1),
+    ("sub",   0), ("sub",  -1), ("sub",  +1),
+    ("none", -2), ("none", +2), ("add",   0),
 ]
 
-ROTATE_NCC_MIN = 0.35
-ROTATE_NCC_SUBMIT = 0.50   # NCC 低于此值时认为方向不确定，直接切 alt 而非提交
+ROTATE_NCC_MIN = 0.15
+ROTATE_NCC_SUBMIT = 0.28
 ALIGN_STATE = {"counter": 0}
+_MOUSE_POS = {"x": None, "y": None}
 
 
 STEALTH_JS = r"""
@@ -98,9 +83,7 @@ STEALTH_JS = r"""
     });
   } catch(e) {}
   try { Object.defineProperty(navigator, 'languages', { get: () => ['en-US','en','zh-CN'] }); } catch(e) {}
-  try {
-    if (!window.chrome) window.chrome = { runtime:{}, loadTimes:function(){}, csi:function(){}, app:{} };
-  } catch(e) {}
+  try { if (!window.chrome) window.chrome = { runtime:{}, loadTimes:function(){}, csi:function(){}, app:{} }; } catch(e) {}
   ['__selenium_unwrapped','__webdriver_evaluate','__selenium_evaluate','__driver_evaluate',
    '__fxdriver_evaluate','_Selenium_IDE_Recorder','__webdriver_script_fn','__webdriver_script_func',
    '__webdriver_script_url','__driver_script_fn','__driver_script_url','_phantom','__nightmare',
@@ -113,7 +96,6 @@ STEALTH_JS = r"""
 """
 
 
-# ================= WebSocket 状态 =================
 WS_STATE = {
     "url": None, "meta": None, "frames": [], "last_resp": None,
     "sent": [], "closed": False, "fail_pending": False,
@@ -179,8 +161,6 @@ def _install_ws_hook(page):
     page.on("websocket", on_ws)
 
 
-# ================= 工具 =================
-
 def send_telegram_message(message: str):
     if not TG_BOT_TOKEN or not TG_CHAT_ID:
         print(f"   📢 [本地] {message}")
@@ -226,8 +206,6 @@ def wait_for_cloudflare(page, timeout=15):
         time.sleep(1)
     return False
 
-
-# ================= Discord OAuth 登录 =================
 
 def login_with_discord_token(page, dc_token: str) -> bool:
     print("=" * 50)
@@ -333,7 +311,6 @@ def login_with_discord_token(page, dc_token: str) -> bool:
                                "AppleWebKit/537.36 (KHTML, like Gecko) "
                                "Chrome/130.0.0.0 Safari/537.36"),
             },
-            # guild_id/location_context 与真实浏览器请求一致（抓包验证）
             json={
                 "guild_id": DISCORD_GUILD_ID,
                 "permissions": "0", "authorize": True, "integration_type": 0,
@@ -401,8 +378,6 @@ def _chip_shape(chip):
     return {
         "w": cx1 - cx0, "h": cy1 - cy0,
         "circ": circ, "nv": len(approx),
-        "alpha_x0": cx0, "alpha_y0": cy0,
-        "alpha_x1": cx1, "alpha_y1": cy1,
         "alpha_cx": (cx0 + cx1) / 2.0,
         "alpha_cy": (cy0 + cy1) / 2.0,
     }
@@ -459,12 +434,20 @@ def _solve_puzzle(bg_bytes, chip_bytes, meta, align_idx=0):
     for c in candidates:
         bw, bh = c["bbox"][2], c["bbox"][3]
         size_score = 1.0 - min(1.0, abs(bw - chip_w) + abs(bh - chip_h)) / 100.0
+
         if chip_nv in (3, 4, 5, 6, 7, 8):
-            shape_score = 1.0 if c["nv"] == chip_nv else 0.2
+            nv_diff = abs(c["nv"] - chip_nv)
+            nv_score = max(0.0, 1.0 - nv_diff * 0.3)
+            if chip_circ > 0.75:
+                circ_score = 1.0 if c["circ"] > 0.7 else 0.4
+                shape_score = 0.6 * nv_score + 0.4 * circ_score
+            else:
+                shape_score = nv_score
         elif chip_circ > 0.75:
-            shape_score = 1.0 if c["circ"] > 0.75 else 0.2
+            shape_score = 1.0 if c["circ"] > 0.7 else 0.2
         else:
             shape_score = max(0.0, 1.0 - abs(c["circ"] - chip_circ))
+
         score = 0.7 * shape_score + 0.3 * size_score
         scored.append((score, c))
         print(f"      bbox={c['bbox']} nv={c['nv']} circ={c['circ']:.2f} "
@@ -546,23 +529,41 @@ def _solve_rotate(bg_bytes, chip_bytes, meta, tag=""):
         chip_mask = chip_alpha
 
     ch, cw = chip_gray.shape
-    ccx, ccy = cw / 2.0, ch / 2.0
+
+    solid_ys, solid_xs = np.where(chip_mask > 100)
+    if len(solid_xs) > 0:
+        shape_cx = float(solid_xs.mean())
+        shape_cy = float(solid_ys.mean())
+    else:
+        shape_cx, shape_cy = cw / 2.0, ch / 2.0
+    print(f"   🌀 旋转中心: 形状质心 ({shape_cx:.1f},{shape_cy:.1f}) "
+          f"vs 几何中心 ({cw/2:.1f},{ch/2:.1f})")
+
     tgt_cx = (ox + ow / 2.0) - x0
     tgt_cy = (oy + oh / 2.0) - y0
 
-    def _score(angle):
-        M = cv2.getRotationMatrix2D((ccx, ccy), angle, 1.0)
+    rot_cache = {}
+
+    def _get_rot(angle):
+        if angle in rot_cache:
+            return rot_cache[angle]
+        M = cv2.getRotationMatrix2D((shape_cx, shape_cy), angle, 1.0)
         cos_a, sin_a = abs(M[0, 0]), abs(M[0, 1])
         nw = int(np.ceil(ch * sin_a + cw * cos_a))
         nh = int(np.ceil(ch * cos_a + cw * sin_a))
-        M[0, 2] += nw / 2.0 - ccx
-        M[1, 2] += nh / 2.0 - ccy
+        M[0, 2] += nw / 2.0 - shape_cx
+        M[1, 2] += nh / 2.0 - shape_cy
         rot = cv2.warpAffine(chip_gray, M, (nw, nh),
                              flags=cv2.INTER_LINEAR, borderValue=0)
         rot_m = cv2.warpAffine(chip_mask, M, (nw, nh),
                                flags=cv2.INTER_NEAREST, borderValue=0)
-        px = int(round(tgt_cx - nw / 2.0))
-        py = int(round(tgt_cy - nh / 2.0))
+        rot_cache[angle] = (rot, rot_m, nw, nh)
+        return rot_cache[angle]
+
+    def _score(angle, off_x=0, off_y=0):
+        rot, rot_m, nw, nh = _get_rot(angle)
+        px = int(round(tgt_cx - nw / 2.0)) + off_x
+        py = int(round(tgt_cy - nh / 2.0)) + off_y
         tx0, ty0 = max(0, px), max(0, py)
         tx1, ty1 = min(tw, px + nw), min(th, py + nh)
         if tx1 <= tx0 or ty1 <= ty0:
@@ -593,6 +594,7 @@ def _solve_rotate(bg_bytes, chip_bytes, meta, tag=""):
             best_score, best_angle = s, angle
             best_rot, best_rot_m = rot, rot_m
             best_px, best_py = px, py
+
     for da in (-2, -1, 1, 2):
         angle = (best_angle + da) % 360
         if angle not in all_scores:
@@ -606,19 +608,39 @@ def _solve_rotate(bg_bytes, chip_bytes, meta, tag=""):
             best_rot, best_rot_m = rot, rot_m
             best_px, best_py = px, py
 
-    # 对称歧义消解：180° 对称图标会让 NCC 在 θ 与 θ+180 处出现几乎同高的双峰。
-    # 此时单纯取最高峰可能选到"翻转"的错误朝向。用形状方向线索做裁决：
-    # 比较 θ 与 θ+180 两峰的 NCC，取显著更高者；若几乎相等则保留原 best。
+    best_off_x, best_off_y = 0, 0
+    for dx in (-6, -4, -2, 2, 4, 6):
+        for dy in (-6, -4, -2, 2, 4, 6):
+            s, rot, rot_m, px, py = _score(best_angle, dx, dy)
+            if s > best_score:
+                best_score = s
+                best_off_x, best_off_y = dx, dy
+                best_rot, best_rot_m = rot, rot_m
+                best_px, best_py = px, py
+    if best_off_x or best_off_y:
+        print(f"   🔧 平移细化: off=({best_off_x:+d},{best_off_y:+d}) ncc={best_score:.3f}")
+
     alt = (best_angle + 180) % 360
     alt_score = all_scores.get(alt, _score(alt)[0])
-    if alt_score > best_score + 0.02:
+    print(f"   📐 双峰: best={best_angle}° ncc={best_score:.3f} | "
+          f"alt={alt}° ncc={alt_score:.3f}")
+    if alt_score > best_score + 0.08:
         s, rot, rot_m, px, py = _score(alt)
         best_score, best_angle = s, alt
         best_rot, best_rot_m = rot, rot_m
         best_px, best_py = px, py
-        print(f"   🔀 对称消歧: 采用 {alt}° (ncc={alt_score:.3f}) 替代 {alt}±180 双峰")
-    elif abs(alt_score - best_score) < 0.05:
-        print(f"   🔀 180° 双峰接近 (ncc={best_score:.3f}/{alt_score:.3f})，保留 {best_angle}°")
+        print(f"   🔀 采用 alt={alt}° (ncc {alt_score:.3f} 显著高于 {best_score:.3f})")
+    elif abs(alt_score - best_score) < 0.08:
+        choose_alt = best_angle > 180
+        if choose_alt:
+            s, rot, rot_m, px, py = _score(alt)
+            best_score, best_angle = s, alt
+            best_rot, best_rot_m = rot, rot_m
+            best_px, best_py = px, py
+            print(f"   🔀 双峰接近 (diff={abs(alt_score-best_score):.3f})，"
+                  f"启发式选 {alt}°")
+        else:
+            print(f"   🔀 双峰接近 (diff={abs(alt_score-best_score):.3f})，保留 {best_angle}°")
 
     print(f"   🎯 rotate: 逆时针={best_angle}° ncc={best_score:.3f}")
 
@@ -643,15 +665,16 @@ def _solve_rotate(bg_bytes, chip_bytes, meta, tag=""):
         print(f"   ⚠️ NCC {best_score:.3f} 低于提交阈值 {ROTATE_NCC_SUBMIT}，放弃提交")
         return -1
 
-    return (360 - best_angle) % 360
+    # ★★★ v25: 根据 ROTATE_MODE 决定返回值
+    if ROTATE_MODE == "inverse":
+        value = (360 - best_angle) % 360
+    else:
+        value = best_angle
+    print(f"   📤 返回 value={value} (mode={ROTATE_MODE})")
+    return value
 
 
 def _solve_odd(bg_bytes, meta):
-    """odd: 图上 4 个图形中有一个异类，返回异类的 x 坐标。
-
-    先按中心颜色聚类找颜色异类；若无，再按灰度 patch 与其余均值的
-    NCC 找形状异类。已用抓包 4 帧验证全部命中。
-    """
     bg = _decode(bg_bytes)
     if bg is None:
         raise RuntimeError("解码失败")
@@ -661,7 +684,6 @@ def _solve_odd(bg_bytes, meta):
     if len(items) < 2:
         raise RuntimeError("items 不足")
 
-    # 采样每个 item 中心的平均 RGB
     colors = []
     for it in items:
         x, y = int(it["x"]), int(it["y"])
@@ -670,19 +692,21 @@ def _solve_odd(bg_bytes, meta):
     colors = np.array(colors)
 
     n = len(items)
-    # 两两欧氏距离的均值，最大者即颜色异类候选
     dists = []
     for i in range(n):
         d = sum(float(np.linalg.norm(colors[i] - colors[j]))
                 for j in range(n) if j != i)
         dists.append(d / (n - 1))
-    ci = int(np.argmax(dists))
-    if dists[ci] > float(np.mean(dists)) * 1.3:
-        print(f"   🎨 odd 颜色异类: item#{ci} {items[ci]} "
-              f"dist={dists[ci]:.1f} avg={np.mean(dists):.1f}")
-        return int(items[ci]["x"])
 
-    # 颜色无差异 → 形状异类: 每个 item 与其余 resize 后均值的 NCC
+    ci = int(np.argmax(dists))
+    mean_d = float(np.mean(dists))
+    # ★★★ v25: 回退到 1.5 倍阈值 —— 修复之前 2.0 倍导致异类 dist == threshold 的 bug
+    color_threshold = max(mean_d * 1.5, 180.0)
+    if dists[ci] > color_threshold:
+        print(f"   🎨 odd 颜色异类: item#{ci} {items[ci]} "
+              f"dist={dists[ci]:.1f} avg={mean_d:.1f} thr={color_threshold:.1f}")
+        return ci
+
     gray = cv2.cvtColor(rgb, cv2.COLOR_BGR2GRAY)
     patches = []
     for it in items:
@@ -701,16 +725,15 @@ def _solve_odd(bg_bytes, meta):
         bv = p - p.mean()
         d = float(np.sqrt((av * av).sum() * (bv * bv).sum()))
         scores.append(float((av * bv).sum() / d) if d > 1e-6 else 0.0)
-    si = int(np.argmin(scores))  # 最低 NCC = 最不同
-    print(f"   🎨 odd 形状异类: item#{si} {items[si]} ncc={scores[si]:.3f}")
-    return int(items[si]["x"])
+    si = int(np.argmin(scores))
+    print(f"   🎨 odd 形状异类: item#{si} {items[si]} ncc={scores[si]:.3f} "
+          f"(颜色未过阈: {dists[ci]:.1f} vs thr {color_threshold:.1f})")
+    return si
 
 
-def _solve_match(bg_bytes, meta):
-    """match: 左右两列卡片，返回配对编码 matchMap[0]*100+[1]*10+[2]。
-
-    用左右 item 的灰度 patch NCC 找最相似配对（每张左卡对应最像的右卡）。
-    """
+def _match_map_calc(bg_bytes, meta, strategy=None):
+    if strategy is None:
+        strategy = MATCH_STRATEGY
     bg = _decode(bg_bytes)
     if bg is None:
         raise RuntimeError("解码失败")
@@ -740,11 +763,19 @@ def _solve_match(bg_bytes, meta):
         d = float(np.sqrt((av * av).sum() * (bv * bv).sum()))
         return float((av * bv).sum() / d) if d > 1e-6 else 0.0
 
+    mat = [[_ncc(lp[i], rp[j]) for j in range(3)] for i in range(3)]
+    print(f"   📊 NCC 矩阵 (策略={strategy}):  r0      r1      r2")
+    for i in range(3):
+        row = "  ".join(f"{mat[i][j]:+.2f}" for j in range(3))
+        print(f"      l{i}: {row}")
+
     match_map = []
     used = set()
     for i in range(3):
-        sims = [(_ncc(lp[i], rp[j]), j) for j in range(3)]
-        sims.sort(reverse=True)
+        if strategy == "diff":
+            sims = sorted([(mat[i][j], j) for j in range(3)])
+        else:
+            sims = sorted([(mat[i][j], j) for j in range(3)], reverse=True)
         for _, j in sims:
             if j not in used:
                 used.add(j)
@@ -753,13 +784,17 @@ def _solve_match(bg_bytes, meta):
         else:
             match_map.append(0)
     print(f"   🎨 match 配对: {match_map}")
-    return match_map[0] * 100 + match_map[1] * 10 + match_map[2]
+    return match_map
+
+
+def _solve_match(bg_bytes, meta):
+    m = _match_map_calc(bg_bytes, meta)
+    return m[0] * 100 + m[1] * 10 + m[2]
 
 
 # ================= 交互 =================
 
 def _box_pos_to_page(page, x, y):
-    """把验证码图内坐标 (0..w, 0..h) 换算成页面绝对坐标。"""
     box = page.locator("#captcha_box_default")
     box.wait_for(state="visible", timeout=5000)
     bb = box.bounding_box()
@@ -773,17 +808,20 @@ def _box_pos_to_page(page, x, y):
 
 
 def _hover_to(page, tx, ty, steps=None):
-    """鼠标带随机抖动自然移动到目标点。
-
-    间隔 >16ms：前端 rec() 有 16ms 限流，间隔太短会被丢弃导致行为样本过少。
-    """
     if steps is None:
-        steps = random.randint(14, 24)
-    # 从浏览器实际鼠标位置出发
-    cur = page.evaluate(
-        "() => [window.__owMouseX || window.innerWidth / 2, "
-        "window.__owMouseY || window.innerHeight / 2]")
-    cx, cy = cur[0], cur[1]
+        dist = 0
+        if _MOUSE_POS["x"] is not None:
+            dist = ((tx - _MOUSE_POS["x"]) ** 2 + (ty - _MOUSE_POS["y"]) ** 2) ** 0.5
+        if dist < 80:
+            steps = random.randint(6, 10)
+        elif dist < 400:
+            steps = random.randint(10, 18)
+        else:
+            steps = random.randint(16, 26)
+
+    cx = _MOUSE_POS["x"] if _MOUSE_POS["x"] is not None else 640
+    cy = _MOUSE_POS["y"] if _MOUSE_POS["y"] is not None else 360
+
     for i in range(1, steps + 1):
         t = i / steps
         eased = 1 - (1 - t) ** 2
@@ -791,142 +829,104 @@ def _hover_to(page, tx, ty, steps=None):
         y = cy + (ty - cy) * eased + random.uniform(-1.5, 1.5)
         page.mouse.move(x, y)
         page.wait_for_timeout(random.randint(18, 38))
-        # 记录当前位置，供下次衔接
-        page.evaluate("([x, y]) => { window.__owMouseX = x; window.__owMouseY = y; }",
-                      [x, y])
     page.mouse.move(tx + random.uniform(-0.5, 0.5), ty + random.uniform(-0.5, 0.5))
     page.wait_for_timeout(random.randint(60, 150))
+    _MOUSE_POS["x"] = tx
+    _MOUSE_POS["y"] = ty
 
 
 def _click_captcha_point(page, x, y):
-    """在验证码图 (x,y) 处产生 hover→click，供前端 rec() 记录行为轨迹。"""
     px, py = _box_pos_to_page(page, x, y)
-    # 先在图上随意 hover 一下（产生行为样本），再移向目标点击
     box = page.locator("#captcha_box_default")
     bb = box.bounding_box()
     hx = bb["x"] + bb["width"] * random.uniform(0.2, 0.8)
     hy = bb["y"] + bb["height"] * random.uniform(0.2, 0.8)
-    page.mouse.move(hx, hy)
-    page.wait_for_timeout(random.randint(120, 260))
+    _hover_to(page, hx, hy)
+    page.wait_for_timeout(random.randint(150, 320))
+
+    px += random.gauss(0, 6)
+    py += random.gauss(0, 6)
+
     _hover_to(page, px, py)
+    page.wait_for_timeout(random.randint(80, 200))
+
+    hold = random.choices(
+        [random.randint(60, 100),
+         random.randint(120, 220),
+         random.randint(240, 380)],
+        weights=[0.55, 0.35, 0.10])[0]
     page.mouse.down()
-    page.wait_for_timeout(random.randint(40, 90))
+    page.wait_for_timeout(hold)
     page.mouse.up()
-    page.wait_for_timeout(random.randint(200, 400))
+    page.wait_for_timeout(random.randint(200, 450))
 
 
-def _click_match_pairs(page, meta):
-    """match: 依次点击左卡 i → 右卡 matchMap[i]，共 3 对。"""
+def _click_match_pairs(page, meta, match_map):
+    """★ v25: 强化行为 —— 瞄-犹豫-回-再点、长停顿、二次轻点。"""
     left = meta.get("left") or []
     right = meta.get("right") or []
     if len(left) != 3 or len(right) != 3:
         raise RuntimeError("match left/right 需各 3 个")
 
-    match_map = _match_map_for_click(page, meta)
-
-    # 每张卡片：先从一个"别处"的随机位置移过来（人不会从上一个卡片直接
-    # 匀速滑过去），落到卡上再加 ±3~5px 随机偏移（人不会次次点精确中心），
-    # 偶尔二次点击确认。
     box = page.locator("#captcha_box_default")
     bb = box.bounding_box()
 
-    def _jitter_target(px, py):
-        return px + random.uniform(-4, 4), py + random.uniform(-4, 4)
+    def _jitter(px, py):
+        return px + random.gauss(0, 5), py + random.gauss(0, 5)
+
+    def _human_click(px, py):
+        # ★ 先 hover 到目标附近（偏移 ±15px），停一下，再移到目标
+        near_x = px + random.uniform(-15, 15)
+        near_y = py + random.uniform(-15, 15)
+        _hover_to(page, near_x, near_y)
+        page.wait_for_timeout(random.randint(120, 280))
+        # 再精确移到目标
+        _hover_to(page, px, py)
+        page.wait_for_timeout(random.randint(80, 200))
+
+        hold = random.choices(
+            [random.randint(60, 100),
+             random.randint(120, 220),
+             random.randint(240, 380)],
+            weights=[0.55, 0.35, 0.10])[0]
+        page.mouse.down()
+        page.wait_for_timeout(hold)
+        page.mouse.up()
+        # 偶发二次轻点
+        if random.random() < 0.20:
+            page.wait_for_timeout(random.randint(80, 200))
+            page.mouse.down()
+            page.wait_for_timeout(random.randint(50, 130))
+            page.mouse.up()
 
     for i in range(3):
-        # 每对开始先在图内某处 hover 一下（产生行为样本 + 打破匀速感）
+        # ★ 每次点击前，先在图上随机晃一下
         hx = bb["x"] + bb["width"] * random.uniform(0.15, 0.85)
         hy = bb["y"] + bb["height"] * random.uniform(0.15, 0.85)
-        page.mouse.move(hx, hy)
-        page.wait_for_timeout(random.randint(150, 400))
+        _hover_to(page, hx, hy)
+        page.wait_for_timeout(random.randint(180, 420))
 
         # 左卡
         lx, ly = _box_pos_to_page(page, left[i]["x"], left[i]["y"])
-        lx, ly = _jitter_target(lx, ly)
-        _hover_to(page, lx, ly)
-        page.wait_for_timeout(random.randint(60, 180))
-        page.mouse.down()
-        page.wait_for_timeout(random.randint(50, 120))
-        page.mouse.up()
-        if random.random() < 0.35:
-            # 偶尔二次轻点（人确认时的小习惯）
-            page.wait_for_timeout(random.randint(60, 140))
-            page.mouse.down()
-            page.wait_for_timeout(random.randint(30, 70))
-            page.mouse.up()
-        # 左→右间隔大区间随机
-        page.wait_for_timeout(random.randint(400, 1100))
+        lx, ly = _jitter(lx, ly)
+        _human_click(lx, ly)
+
+        # ★ 左→右之间长停顿（模拟看图思考）
+        if i == 1:
+            page.wait_for_timeout(random.randint(1400, 2200))
+        else:
+            page.wait_for_timeout(random.randint(600, 1200))
 
         # 右卡
         rj = right[match_map[i]]
         rx, ry = _box_pos_to_page(page, rj["x"], rj["y"])
-        rx, ry = _jitter_target(rx, ry)
-        _hover_to(page, rx, ry)
-        page.wait_for_timeout(random.randint(60, 180))
-        page.mouse.down()
-        page.wait_for_timeout(random.randint(50, 120))
-        page.mouse.up()
-        if random.random() < 0.35:
-            page.wait_for_timeout(random.randint(60, 140))
-            page.mouse.down()
-            page.wait_for_timeout(random.randint(30, 70))
-            page.mouse.up()
-        # 每对之间更长、更随机的停顿
-        page.wait_for_timeout(random.randint(500, 1300))
+        rx, ry = _jitter(rx, ry)
+        _human_click(rx, ry)
+
+        # 每对之间停顿
+        page.wait_for_timeout(random.randint(700, 1500))
 
     page.wait_for_timeout(random.randint(600, 1100))
-
-
-def _match_map_for_click(page, meta):
-    """与 _solve_match 相同的配对计算（供点击用），从最近的验证码帧算。"""
-    frames = WS_STATE.get("frames") or []
-    if not frames:
-        raise RuntimeError("无验证码帧")
-    return _match_map_calc(frames[0], meta)
-
-
-def _match_map_calc(bg_bytes, meta):
-    """_solve_match 的配对核心（返回 match_map 列表而非编码）。"""
-    bg = _decode(bg_bytes)
-    if bg is None:
-        raise RuntimeError("解码失败")
-    rgb = bg[:, :, :3] if bg.ndim == 3 else cv2.cvtColor(bg, cv2.COLOR_GRAY2BGR)
-    gray = cv2.cvtColor(rgb, cv2.COLOR_BGR2GRAY)
-
-    left = meta.get("left") or []
-    right = meta.get("right") or []
-
-    def _patch(it):
-        x, y, r = int(it["x"]), int(it["y"]), int(it.get("r") or 24)
-        sub = gray[max(0, y - r):y + r, max(0, x - r):x + r]
-        return sub.astype(np.float32)
-
-    lp = [_patch(it) for it in left]
-    rp = [_patch(it) for it in right]
-    h = min(p.shape[0] for p in lp + rp)
-    w = min(p.shape[1] for p in lp + rp)
-    lp = [cv2.resize(p, (w, h)) for p in lp]
-    rp = [cv2.resize(p, (w, h)) for p in rp]
-
-    def _ncc(a, b):
-        av = a - a.mean()
-        bv = b - b.mean()
-        d = float(np.sqrt((av * av).sum() * (bv * bv).sum()))
-        return float((av * bv).sum() / d) if d > 1e-6 else 0.0
-
-    match_map = []
-    used = set()
-    for i in range(3):
-        sims = [(_ncc(lp[i], rp[j]), j) for j in range(3)]
-        sims.sort(reverse=True)
-        for _, j in sims:
-            if j not in used:
-                used.add(j)
-                match_map.append(j)
-                break
-        else:
-            match_map.append(0)
-    return match_map
 
 
 def _drag_slider(page, value, vmax):
@@ -949,12 +949,11 @@ def _drag_slider(page, value, vmax):
     dist = target_x - start_x
 
     page.mouse.move(start_x, y)
+    _MOUSE_POS["x"], _MOUSE_POS["y"] = start_x, y
     page.wait_for_timeout(random.randint(80, 200))
     page.mouse.down()
     page.wait_for_timeout(random.randint(80, 180))
 
-    # 真人拖动节奏不均匀：快启动 → 中途变慢/停顿 → 收尾微调。
-    # 分 3 段：60% 距离快速推进，25% 中速并偶有微停顿，15% 缓慢逼近。
     seg_fracs = [0.60, 0.25, 0.15]
     seg_steps = [random.randint(14, 18), random.randint(8, 12), random.randint(8, 12)]
     cum = 0.0
@@ -963,26 +962,24 @@ def _drag_slider(page, value, vmax):
         prev = start_x + dist * cum
         for i in range(1, ns + 1):
             t = i / ns
-            eased = 1 - (1 - t) ** 2  # 各段内部再缓入
+            eased = 1 - (1 - t) ** 2
             x = prev + (seg_end - prev) * eased + random.uniform(-1.2, 1.2)
             yy = y + random.uniform(-1.5, 1.5)
             page.mouse.move(x, yy)
             base_dt = (24, 60) if si == 2 else ((40, 90) if si == 1 else (18, 38))
             page.wait_for_timeout(random.randint(*base_dt))
-            # 中段偶尔停顿一下（模拟手抖 / 犹豫）
             if si == 1 and random.random() < 0.25:
                 page.mouse.move(x + random.uniform(-1, 1), yy + random.uniform(-1, 1))
                 page.wait_for_timeout(random.randint(60, 150))
         cum += sf
 
-    # 收尾：轻微越过目标再回拉（更像人松手前的小调整）
     over = random.uniform(2, 5)
-    page.mouse.move(target_x + over, y + random.uniform(-2, 2))
+    safe_right = box["x"] + box["width"] - hw / 2 - 1
+    page.mouse.move(min(target_x + over, safe_right), y + random.uniform(-2, 2))
     page.wait_for_timeout(random.randint(40, 80))
     back = random.uniform(1, 3)
     page.mouse.move(target_x - back, y + random.uniform(-1, 1))
     page.wait_for_timeout(random.randint(30, 70))
-    # 回拉后可能再有一次微回弹，最后才稳定
     if random.random() < 0.5:
         page.mouse.move(target_x - back + random.uniform(0.5, 1.5),
                         y + random.uniform(-0.5, 0.5))
@@ -990,6 +987,7 @@ def _drag_slider(page, value, vmax):
     page.mouse.move(target_x + random.uniform(-1, 1), y + random.uniform(-1, 1))
     page.wait_for_timeout(random.randint(30, 80))
     page.mouse.up()
+    _MOUSE_POS["x"], _MOUSE_POS["y"] = target_x, y
     page.wait_for_timeout(random.randint(120, 300))
 
 
@@ -1006,6 +1004,7 @@ def _handle_one_stage(page, meta, frames, tag="", align_idx=0):
             try:
                 btn = page.locator("#captcha_switch_default").first
                 if btn.is_visible(timeout=1500):
+                    page.wait_for_timeout(random.randint(900, 1800))
                     btn.click()
                     print(f"   🔁 切换类型: {kind} → {alt}")
                     return "switched"
@@ -1026,6 +1025,7 @@ def _handle_one_stage(page, meta, frames, tag="", align_idx=0):
                 try:
                     btn = page.locator("#captcha_switch_default").first
                     if btn.is_visible(timeout=1500):
+                        page.wait_for_timeout(random.randint(900, 1800))
                         btn.click()
                         print(f"   🔁 切换类型: {kind} → {alt}")
                         return "switched"
@@ -1043,11 +1043,13 @@ def _handle_one_stage(page, meta, frames, tag="", align_idx=0):
         try:
             value = _solve_rotate(frames[0], frames[1], meta, tag=tag)
             if value < 0:
+                # ★★★ v25: 回退到 v23 行为 —— rotate 失败切 alt（保留会话）
                 print(f"   ⚠️ rotate 求解失败（NCC 过低），尝试切换 {alt}")
                 if alt in SUPPORTED_KINDS:
                     try:
                         btn = page.locator("#captcha_switch_default").first
                         if btn.is_visible(timeout=1500):
+                            page.wait_for_timeout(random.randint(900, 1800))
                             btn.click()
                             print(f"   🔁 切换类型: rotate → {alt}")
                             return "switched"
@@ -1062,21 +1064,21 @@ def _handle_one_stage(page, meta, frames, tag="", align_idx=0):
             return False
 
     if kind in ("odd", "match"):
-        # 点击类: 滑块被隐藏，直接在验证码图上点击
         if len(frames) < 1:
             print("   ⚠️ nf<1")
             return False
         try:
             if kind == "odd":
-                ans_x = _solve_odd(frames[0], meta)
-                item = next(it for it in (meta.get("items") or [])
-                            if int(it["x"]) == ans_x)
-                print(f"   🖱️ odd 点击 ({item['x']},{item['y']}) ans={ans_x}")
+                si = _solve_odd(frames[0], meta)
+                items = meta.get("items") or []
+                item = items[si]
+                print(f"   🖱️ odd 点击 item#{si} ({item['x']},{item['y']})")
                 _click_captcha_point(page, item["x"], item["y"])
             else:
-                ans = _solve_match(frames[0], meta)
+                mm = _match_map_calc(frames[0], meta)
+                ans = mm[0] * 100 + mm[1] * 10 + mm[2]
                 print(f"   🖱️ match ans={ans}")
-                _click_match_pairs(page, meta)
+                _click_match_pairs(page, meta, mm)
             return True
         except Exception as e:
             print(f"   ❌ {kind}: {e}")
@@ -1132,15 +1134,11 @@ def _try_renew_session(page, attempt, initial_days):
                 return None
             handled_fps.clear()
             WS_STATE["frames"] = []
-            if WS_STATE.get("closed"):
-                print("   ⚠️ fail 后 WS 已关闭，退出会话")
-                return None
             page.wait_for_timeout(350)
             continue
 
         resp = WS_STATE["last_resp"]
 
-        # rate 限流：服务端返回 "rate" 表示请求过频，本轮直接放弃
         if resp == "rate":
             print("   ⚠️ 收到 rate 限流，本轮不再尝试")
             return None
@@ -1149,11 +1147,8 @@ def _try_renew_session(page, attempt, initial_days):
             token = resp[3:]
             print(f"   🎉 全部通过！token 长度={len(token)}")
 
-            # 点 Confirm 前截图，记录当时页面状态
             save_screenshot(page, "confirm_before")
 
-            # 点 Confirm 时不再吞异常谎报成功。按钮可能没渲染/被验证码层挡住，
-            # 所以分级重试：等渲染 → 强制可见 → 点击，成功才进入天数确认。
             confirm_ok = False
             for sel in ("button.btn-primary:has-text('Confirm Renewal')",
                          "button:has-text('Confirm Renewal')",
@@ -1168,7 +1163,6 @@ def _try_renew_session(page, attempt, initial_days):
                 except Exception as e:
                     print(f"   ⚠️ Confirm 选择器 {sel} 失败: {str(e)[:120]}")
             if not confirm_ok:
-                # 都没点中：再宽等一次后强制点第一个匹配的（force 绕过被遮挡）
                 try:
                     page.locator("button:has-text('Confirm')").first.click(
                         timeout=3000, force=True)
@@ -1177,13 +1171,8 @@ def _try_renew_session(page, attempt, initial_days):
                 except Exception as e:
                     print(f"   ❌ Confirm 未能点击: {e}")
 
-            # 点 Confirm 后立刻截图，看页面实际状态
             save_screenshot(page, "confirm_after")
 
-            # 等这个 POST 真正完成。Confirm 是 <form method=POST> 的 submit 按钮，
-            # 点下去浏览器会发 POST /vps/{id}/renew，成功后跳回带新天数的页面。
-            # 之前的问题是：点完立刻 page.reload() 会取消/打断这个 POST，导致加天没落地。
-            # 现在改为等 URL 变化或 body 出现成功提示，最多等 15s。
             page.wait_for_timeout(3000)
             try:
                 page.wait_for_url(
@@ -1194,10 +1183,8 @@ def _try_renew_session(page, attempt, initial_days):
                 pass
             wait_for_cloudflare(page)
 
-            # 再截一张，看提交后页面
             save_screenshot(page, "confirm_result")
 
-            # 服务端给 VPS 加天可能有延迟，轮询读天数（最多 3 次，间隔 8s 防 rate 限流）
             new_days = None
             for _ in range(3):
                 try:
@@ -1274,7 +1261,7 @@ def _try_renew_session(page, attempt, initial_days):
             if switch_count > MAX_SWITCH_PER_SESSION:
                 print("   ⚠️ 切换次数过多，退出")
                 return None
-            page.wait_for_timeout(800)
+            page.wait_for_timeout(random.randint(900, 1800))
             continue
 
         if not result:
@@ -1288,7 +1275,8 @@ def _try_renew_session(page, attempt, initial_days):
     return None
 
 
-def try_renew_captcha(page, initial_days, max_attempts=6):
+def try_renew_captcha(page, initial_days, max_attempts=12):
+    """★ v25: 12 次重试 + 短冷却（1.5–3s）。"""
     for attempt in range(1, max_attempts + 1):
         _reset_align_pick()
         try:
@@ -1307,17 +1295,16 @@ def try_renew_captcha(page, initial_days, max_attempts=6):
             try:
                 page.keyboard.press("Escape")
                 page.wait_for_timeout(500)
+                page.wait_for_timeout(random.randint(1500, 3000))
                 page.reload(wait_until="domcontentloaded", timeout=30000)
                 wait_for_cloudflare(page)
-                page.wait_for_timeout(3000)
+                page.wait_for_timeout(2000)
             except Exception as e:
                 print(f"   ⚠️ 刷新: {e}")
 
     print(f"   ❌ {max_attempts} 次会话均失败")
     return False
 
-
-# ================= VPS 列表 =================
 
 def get_vps_urls(page):
     def extract():
@@ -1357,35 +1344,28 @@ def get_vps_urls(page):
     return urls
 
 
-# ================= 配置检查 =================
-
 def check_config():
     print("=" * 50)
     print("⚙️  配置检查")
     print("=" * 50)
-    print(f"   DISCORD_TOKEN : {'✅ 已设置 (' + DISCORD_TOKEN[:12] + '...)' if DISCORD_TOKEN else '❌ 空'}")
-    print(f"   TG 通知       : {'✅ 已启用' if (TG_BOT_TOKEN and TG_CHAT_ID) else '⚪ 未启用（跳过）'}")
-    print(f"   SITE_BASE     : {SITE_BASE}")
-    print(f"   运行模式      : {'✅ 无头' if HEADLESS else '❌ 有头'}")
-    print(f"   截图目录      : {SCREENSHOT_DIR}")
+    print(f"   DISCORD_TOKEN  : {'✅ 已设置' if DISCORD_TOKEN else '❌ 空'}")
+    print(f"   TG 通知        : {'✅ 已启用' if (TG_BOT_TOKEN and TG_CHAT_ID) else '⚪ 未启用'}")
+    print(f"   SITE_BASE      : {SITE_BASE}")
+    print(f"   运行模式       : {'✅ 无头' if HEADLESS else '❌ 有头'}")
+    print(f"   截图目录       : {SCREENSHOT_DIR}")
+    print(f"   MATCH_STRATEGY : {MATCH_STRATEGY}  (same / diff)")
+    print(f"   ROTATE_MODE    : {ROTATE_MODE}  (direct / inverse)")
 
     if not DISCORD_TOKEN:
         print()
         print("❌ 缺少 DISCORD_TOKEN")
-        print("   请在 GitHub 仓库 → Settings → Secrets and variables → Actions")
-        print("   添加 Secret：")
-        print("     - DISCORD_TOKEN : 必填")
-        print("     - TG_BOT_TOKEN  : 可选（Telegram 机器人 token）")
-        print("     - TG_CHAT_ID    : 可选（Telegram 对话 id）")
         return False
     return True
 
 
-# ================= main =================
-
 def main() -> int:
     print("#" * 60)
-    print("   Openworld VPS 自动续期 (v20-github GitHub Actions 版)")
+    print("   Openworld VPS 自动续期 (v25-github)")
     print("#" * 60)
 
     if not check_config():
